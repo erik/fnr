@@ -10,13 +10,16 @@ categories = ["command-line-utilities"]
 [dependencies]
 anyhow = "1.0.51"
 atty = "0.2.14"
-crossbeam = "0.8.1"
 grep = "0.2.8"
 ignore = "0.4"
 regex = "1.5.4"
-structopt = { version = "0.3" }
+structopt = "0.3"
+termcolor = "1.1.2"
 text_io = "0.1.9"
 
 [dev-dependencies]
 assert_cmd = "1"
 tempdir = "0.3"
+
+[profile.release]
+debug = true

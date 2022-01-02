@@ -2,12 +2,10 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::channel;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{ensure, Context, Result};
 use atty::Stream;
-use crossbeam::thread;
 use grep::matcher::{Captures, Matcher};
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{
@@ -15,8 +13,19 @@ use grep::searcher::{
 };
 use ignore::{WalkBuilder, WalkState};
 use regex::RegexSet;
+use structopt::clap::arg_enum;
 use structopt::StructOpt;
+use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 use text_io::read;
+
+arg_enum! {
+    #[derive(Debug)]
+    enum ColorPreference {
+        Always,
+        Auto,
+        Never
+    }
+}
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "fnr")]
@@ -26,10 +35,6 @@ use text_io::read;
 // /// Search files with the given file extensions.
 // #[structopt(short = "T", long, multiple = true, conflicts_with = "include")]
 // file_type: Option<String>,
-//
-// /// Control whether terminal output is in color.
-// #[structopt(long, allow_values = "always, auto, never", default_value = "auto")]
-// color: String,
 //
 // /// Save changes as a .patch file rather than modifying in place.
 // #[structopt(long)]
@@ -105,6 +110,15 @@ struct Config {
     #[structopt(short = "E", long)]
     exclude: Vec<String>,
 
+    /// Control whether terminal output is in color
+    #[structopt(
+        long,
+        possible_values = &ColorPreference::variants(),
+        case_insensitive = true,
+        default_value = "auto"
+    )]
+    color: ColorPreference,
+
     /// What to search for. Literal string or regular expression.
     ///
     /// For supported regular expression syntax, see:
@@ -131,21 +145,21 @@ struct Config {
 #[derive(Debug, Clone)]
 struct Line(u64, String);
 
+#[derive(Copy, Clone)]
 enum MatchPrintMode {
     Silent,
     Compact,
     Full,
 }
 
-struct MatchFormatter {
+struct MatchFormatterBuilder {
     print_mode: MatchPrintMode,
     writes_enabled: bool,
-    last_line_num: Option<u64>,
 }
 
-impl MatchFormatter {
-    fn from_config(cfg: &Config) -> MatchFormatter {
-        MatchFormatter {
+impl MatchFormatterBuilder {
+    fn from_config(cfg: &Config) -> MatchFormatterBuilder {
+        MatchFormatterBuilder {
             print_mode: if cfg.quiet {
                 MatchPrintMode::Silent
             } else if cfg.compact {
@@ -154,33 +168,59 @@ impl MatchFormatter {
                 MatchPrintMode::Full
             },
             writes_enabled: cfg.write || cfg.prompt,
-            last_line_num: None,
         }
     }
 
-    fn display_header(&mut self, path: &Path, num_matches: usize) {
+    fn build<'a, W: WriteColor>(&self, writer: &'a mut W) -> MatchFormatter<'a, W> {
+        MatchFormatter {
+            writer,
+            print_mode: self.print_mode,
+            writes_enabled: self.writes_enabled,
+            last_line_num: None,
+        }
+    }
+}
+
+struct MatchFormatter<'a, W: WriteColor> {
+    writer: &'a mut W,
+    print_mode: MatchPrintMode,
+    writes_enabled: bool,
+    last_line_num: Option<u64>,
+}
+
+impl<'a, W: WriteColor> MatchFormatter<'a, W> {
+    fn display_header(&mut self, path: &Path, num_matches: usize) -> Result<()> {
         match self.print_mode {
-            MatchPrintMode::Silent => {}
-            MatchPrintMode::Compact => {}
+            MatchPrintMode::Silent => Ok(()),
+            MatchPrintMode::Compact => Ok(()),
             MatchPrintMode::Full => self.display_header_full(path, num_matches),
         }
     }
 
     #[inline]
-    fn display_header_full(&mut self, path: &Path, num_matches: usize) {
-        println!(
-            "\x1B[4m{}\x1B[0m {} match{}",
+    fn display_header_full(&mut self, path: &Path, num_matches: usize) -> Result<()> {
+        self.writer
+            .set_color(ColorSpec::new().set_underline(true))?;
+        writeln!(
+            &mut self.writer,
+            "{}\x1B[0m {} match{}",
             path.display(),
             num_matches,
             if num_matches == 1 { "" } else { "es" }
-        );
+        )?;
 
         self.last_line_num = None;
+        Ok(())
     }
 
-    fn display_match(&mut self, path: &Path, search_match: &SearchMatch, replacement: &str) {
+    fn display_match(
+        &mut self,
+        path: &Path,
+        search_match: &SearchMatch,
+        replacement: &str,
+    ) -> Result<()> {
         match self.print_mode {
-            MatchPrintMode::Silent => {}
+            MatchPrintMode::Silent => Ok(()),
             MatchPrintMode::Compact => self.display_match_compact(path, search_match, replacement),
             MatchPrintMode::Full => self.display_match_full(search_match, replacement),
         }
@@ -192,29 +232,33 @@ impl MatchFormatter {
         path: &Path,
         search_match: &SearchMatch,
         replacement: &str,
-    ) {
+    ) -> Result<()> {
         let path = path.display();
 
         for line in &search_match.context_pre {
-            print!("{}:{}:{}", path, line.0, line.1);
+            write!(&mut self.writer, "{}:{}:{}", path, line.0, line.1)?;
         }
 
-        print!(
+        write!(
+            &mut self.writer,
             "\x1B[31m{}:{}-{}\x1B[0m",
             path, search_match.line.0, search_match.line.1
-        );
-        print!(
+        )?;
+        write!(
+            &mut self.writer,
             "\x1B[32m{}:{}+{}\x1B[0m",
             path, search_match.line.0, replacement
-        );
+        )?;
 
         for line in &search_match.context_post {
-            print!("{}:{}:{}", path, line.0, line.1);
+            write!(&mut self.writer, "{}:{}:{}", path, line.0, line.1)?;
         }
+
+        Ok(())
     }
 
     #[inline]
-    fn display_match_full(&mut self, m: &SearchMatch, replacement: &str) {
+    fn display_match_full(&mut self, m: &SearchMatch, replacement: &str) -> Result<()> {
         let has_line_break = self
             .last_line_num
             .map(|last_line_num| {
@@ -227,42 +271,62 @@ impl MatchFormatter {
             .unwrap_or(false);
 
         if has_line_break {
-            println!("  ---");
+            writeln!(&mut self.writer, "  ---")?;
         }
 
         for line in &m.context_pre {
-            print!(" {:4} {}", line.0, line.1);
+            write!(&mut self.writer, " {:4} {}", line.0, line.1)?;
         }
 
         // TODO: Highlight matching part of line
         // TODO: Disable colors when not atty
-        print!("\x1B[31m-{:4} {}\x1B[0m", m.line.0, m.line.1);
-        print!("\x1B[32m+{:4} {}\x1B[0m", m.line.0, replacement);
+        write!(
+            &mut self.writer,
+            "\x1B[31m-{:4} {}\x1B[0m",
+            m.line.0, m.line.1
+        )?;
+        write!(
+            &mut self.writer,
+            "\x1B[32m+{:4} {}\x1B[0m",
+            m.line.0, replacement
+        )?;
 
         for line in &m.context_post {
-            print!(" {:4} {}", line.0, line.1);
-            self.last_line_num = Some(line.0);
+            write!(&mut self.writer, " {:4} {}", line.0, line.1)?;
+            self.last_line_num.replace(line.0);
         }
+
+        Ok(())
     }
 
-    fn display_footer(&self, total_replacements: usize, total_matches: usize) {
+    fn display_footer(&mut self, total_replacements: usize, total_matches: usize) -> Result<()> {
         match self.print_mode {
-            MatchPrintMode::Silent => {}
-            MatchPrintMode::Compact => {}
+            MatchPrintMode::Silent => Ok(()),
+            MatchPrintMode::Compact => Ok(()),
             MatchPrintMode::Full => self.display_footer_full(total_replacements, total_matches),
         }
     }
 
     #[inline]
-    fn display_footer_full(&self, total_replacements: usize, total_matches: usize) {
-        println!(
+    fn display_footer_full(
+        &mut self,
+        total_replacements: usize,
+        total_matches: usize,
+    ) -> Result<()> {
+        writeln!(
+            &mut self.writer,
             "All done. Replaced {} of {} matches",
             total_replacements, total_matches
-        );
+        )?;
 
         if !self.writes_enabled {
-            println!("Use -w, --write to modify files in place.");
+            writeln!(
+                &mut self.writer,
+                "Use -w, --write to modify files in place."
+            )?;
         }
+
+        Ok(())
     }
 }
 
@@ -406,12 +470,15 @@ struct RegexReplacer {
 }
 
 impl RegexReplacer {
-    fn replace(&self, input: &str) -> Option<String> {
+    fn replace(&self, input: &str) -> Result<String> {
         let mut caps = self.matcher.new_captures().unwrap();
         let mut dst = vec![];
 
-        self.matcher
-            .replace_with_captures(input.as_bytes(), &mut caps, &mut dst, |caps, dst| {
+        self.matcher.replace_with_captures(
+            input.as_bytes(),
+            &mut caps,
+            &mut dst,
+            |caps, dst| {
                 caps.interpolate(
                     |name| self.matcher.capture_index(name),
                     input.as_bytes(),
@@ -419,10 +486,10 @@ impl RegexReplacer {
                     dst,
                 );
                 true
-            })
-            .unwrap();
+            },
+        )?;
 
-        Some(String::from_utf8_lossy(&dst).to_string())
+        Ok(String::from_utf8_lossy(&dst).to_string())
     }
 }
 
@@ -450,9 +517,8 @@ impl SearchProcessor {
 }
 
 struct MatchProcessor {
-    replacer: RegexReplacer,
+    replacer: Arc<RegexReplacer>,
     replacement_decider: ReplacementDecider,
-    match_formatter: MatchFormatter,
 
     total_matches: usize,
     total_replacements: usize,
@@ -460,39 +526,38 @@ struct MatchProcessor {
 
 impl MatchProcessor {
     fn new(
-        replacer: RegexReplacer,
+        replacer: Arc<RegexReplacer>,
         replacement_decider: ReplacementDecider,
-        match_formatter: MatchFormatter,
     ) -> MatchProcessor {
         MatchProcessor {
             replacer,
             replacement_decider,
-            match_formatter,
 
             total_matches: 0,
             total_replacements: 0,
         }
     }
 
-    fn consume_matches(&mut self, path: &Path, matches: &mut Vec<SearchMatch>) -> Result<()> {
+    fn consume_matches<W: WriteColor>(
+        &mut self,
+        path: &Path,
+        matches: Vec<SearchMatch>,
+        match_formatter: &mut MatchFormatter<W>,
+    ) -> Result<()> {
         if matches.is_empty() {
             return Ok(());
         }
 
-        self.match_formatter.display_header(path, matches.len());
+        match_formatter.display_header(path, matches.len())?;
+
         self.total_matches += matches.len();
         self.replacement_decider.reset_local_decision();
 
         let mut replacement_list = vec![];
-        for m in matches.drain(0..) {
-            let replacement = if let Some(r) = self.replacer.replace(&m.line.1) {
-                r
-            } else {
-                println!("TODO: replacer failed on line");
-                continue;
-            };
+        for m in matches.into_iter() {
+            let replacement = self.replacer.replace(&m.line.1)?;
+            match_formatter.display_match(path, &m, &replacement)?;
 
-            self.match_formatter.display_match(path, &m, &replacement);
             let match_replacement = match self.replacement_decider.decide() {
                 ReplacementDecision::Accept => MatchReplacement {
                     search_match: m,
@@ -507,7 +572,7 @@ impl MatchProcessor {
                     }
 
                     line.push('\n');
-                    self.match_formatter.display_match(path, &m, &line);
+                    match_formatter.display_match(path, &m, &line)?;
                     println!("--");
                     MatchReplacement {
                         search_match: m,
@@ -558,9 +623,10 @@ impl MatchProcessor {
         Ok(())
     }
 
-    fn finalize(&self) {
-        self.match_formatter
-            .display_footer(self.total_replacements, self.total_matches);
+    fn finalize(&self) -> Result<()> {
+        Ok(())
+        // match_formatter
+        //     .display_footer(self.total_replacements, self.total_matches)
     }
 }
 
@@ -578,6 +644,7 @@ fn read_input(prompt: &str) -> Result<String, std::io::Error> {
     Ok(read!("{}\n"))
 }
 
+#[derive(Clone, Copy)]
 struct ReplacementDecider {
     should_prompt: bool,
     global_decision: Option<ReplacementDecision>,
@@ -585,18 +652,13 @@ struct ReplacementDecider {
 }
 
 impl ReplacementDecider {
-    fn with_prompt() -> ReplacementDecider {
+    fn new(
+        should_prompt: bool,
+        global_decision: Option<ReplacementDecision>,
+    ) -> ReplacementDecider {
         ReplacementDecider {
-            should_prompt: true,
-            global_decision: None,
-            local_decision: None,
-        }
-    }
-
-    fn constantly(decision: ReplacementDecision) -> ReplacementDecider {
-        ReplacementDecider {
-            should_prompt: false,
-            global_decision: Some(decision),
+            global_decision,
+            should_prompt,
             local_decision: None,
         }
     }
@@ -662,7 +724,8 @@ e - edit this replacement
 struct FindAndReplacer {
     file_walker: WalkBuilder,
     path_matcher: PathMatcher,
-    match_processor: MatchProcessor,
+    match_formatter: MatchFormatterBuilder,
+    match_processor_factory: Box<dyn Fn() -> MatchProcessor>,
     searcher_factory: Box<dyn Fn() -> SearchProcessor + Sync>,
 }
 
@@ -706,16 +769,24 @@ impl FindAndReplacer {
             template: config.replace.to_owned(),
         };
 
-        let replacement_decider = if config.prompt {
-            ReplacementDecider::with_prompt()
-        } else if config.write {
-            ReplacementDecider::constantly(ReplacementDecision::Accept)
-        } else {
-            ReplacementDecider::constantly(ReplacementDecision::Ignore)
-        };
+        let match_formatter = MatchFormatterBuilder::from_config(&config);
 
-        let match_formatter = MatchFormatter::from_config(&config);
-        let match_processor = MatchProcessor::new(replacer, replacement_decider, match_formatter);
+        let match_processor_factory = {
+            let replacer = Arc::new(replacer);
+
+            let global_replacement_decision = if config.prompt {
+                None
+            } else if config.write {
+                Some(ReplacementDecision::Accept)
+            } else {
+                Some(ReplacementDecision::Ignore)
+            };
+
+            let replacement_decider =
+                ReplacementDecider::new(config.prompt, global_replacement_decision);
+
+            Box::new(move || MatchProcessor::new(replacer.clone(), replacement_decider))
+        };
 
         let searcher_factory = {
             let matcher = Arc::new(pattern_matcher);
@@ -778,66 +849,69 @@ impl FindAndReplacer {
             file_walker,
             path_matcher,
             searcher_factory,
-            match_processor,
+            match_processor_factory,
+            match_formatter,
         })
     }
 
     fn run(&mut self) -> Result<()> {
-        thread::scope(|thread_scope| {
-            let (tx, rx) = channel();
-            let file_walker = self.file_walker.build_parallel();
-            let searcher_factory = &self.searcher_factory;
-            let path_matcher = &self.path_matcher;
+        let file_walker = self.file_walker.threads(12).build_parallel();
+        let searcher_factory = &self.searcher_factory;
+        let match_processor_factory = &self.match_processor_factory;
+        let path_matcher = &self.path_matcher;
+        let match_formatter = &self.match_formatter;
 
-            // TODO: No real reason this needs to happen in another
-            // thread. Combine match processor + searcher and allow
-            // file_walker.run to manage the parallelism.
-            thread_scope.spawn(move |_| {
-                file_walker.run(|| {
-                    let tx = tx.clone();
+        let buf_writer = BufferWriter::stdout(ColorChoice::Always);
 
-                    Box::new(move |dir_entry| {
-                        let dir_entry = dir_entry.unwrap();
-                        if !dir_entry.file_type().unwrap().is_file() {
-                            return WalkState::Continue;
-                        }
+        file_walker.run(|| {
+            let buf_writer = &buf_writer;
+            let mut match_processor = (match_processor_factory)();
+            let mut searcher = (searcher_factory)();
 
-                        let path = dir_entry.path();
-                        if !path_matcher.is_match(path) {
-                            return WalkState::Continue;
-                        }
+            Box::new(move |dir_entry| {
+                let dir_entry = dir_entry.unwrap();
+                if !dir_entry.file_type().unwrap().is_file() {
+                    return WalkState::Continue;
+                }
 
-                        let mut searcher = (searcher_factory)();
-                        match searcher.search_path(path) {
-                            Ok(matches) => {
-                                // TODO: it would be cheaper to handle matches
-                                // here rather than sending to another thread.
-                                tx.send((path.to_owned(), matches)).unwrap();
-                                WalkState::Continue
-                            }
+                let path = dir_entry.path();
+                if !path_matcher.is_match(path) {
+                    return WalkState::Continue;
+                }
 
-                            err => {
-                                eprintln!("search failed: {:?}", err);
-                                WalkState::Quit
-                            }
-                        }
-                    })
-                });
+                let mut writer = buf_writer.buffer();
 
-                // Close the channel
-                drop(tx);
-            });
+                let matches = match searcher.search_path(path) {
+                    Ok(matches) => matches,
 
-            // TODO: Handle errors here.
-            for (path, mut matches) in rx.iter() {
-                self.match_processor
-                    .consume_matches(&path, &mut matches)
-                    .unwrap();
-            }
-        })
-        .unwrap();
+                    err => {
+                        eprintln!("search failed: {:?}", err);
+                        return WalkState::Quit;
+                    }
+                };
 
-        self.match_processor.finalize();
+                if let Err(err) = {
+                    let mut match_formatter = match_formatter.build(&mut writer);
+                    match_processor.consume_matches(path, matches, &mut match_formatter)
+                } {
+                    eprintln!("{}: {}", path.display(), err);
+                    return WalkState::Quit;
+                }
+
+                if let Err(err) = buf_writer.print(&writer) {
+                    // A broken pipe means graceful termination.
+                    if err.kind() == std::io::ErrorKind::BrokenPipe {
+                        return WalkState::Quit;
+                    }
+                    // Otherwise, we continue on our merry way.
+                    eprintln!("{}: {}", path.display(), err);
+                }
+
+                WalkState::Continue
+            })
+        });
+
+        // self.match_processor.finalize()?;
 
         Ok(())
     }
