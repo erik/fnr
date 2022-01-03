@@ -8,15 +8,17 @@ use anyhow::{ensure, Context, Result};
 use atty::Stream;
 use grep::matcher::{Captures, Matcher};
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
-use grep::searcher::{
-    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
-};
+use grep::searcher::{BinaryDetection, SearcherBuilder};
 use ignore::{WalkBuilder, WalkState};
 use regex::RegexSet;
 use structopt::clap::arg_enum;
 use structopt::StructOpt;
 use termcolor::{BufferWriter, ColorChoice, ColorSpec, WriteColor};
 use text_io::read;
+
+mod search;
+
+use crate::search::{Match, RegexSearcherBuilder};
 
 arg_enum! {
     #[derive(Debug)]
@@ -160,9 +162,6 @@ struct Config {
 
 impl Config {}
 
-#[derive(Debug, Clone)]
-struct Line(u64, String);
-
 #[derive(Copy, Clone)]
 enum MatchPrintMode {
     Silent,
@@ -201,6 +200,7 @@ impl MatchFormatterBuilder {
 
 struct MatchFormatter<'a, W: WriteColor> {
     writer: &'a mut W,
+
     print_mode: MatchPrintMode,
     writes_enabled: bool,
     last_line_num: Option<u64>,
@@ -235,7 +235,7 @@ impl<'a, W: WriteColor> MatchFormatter<'a, W> {
     fn display_match(
         &mut self,
         path: &Path,
-        search_match: &SearchMatch,
+        search_match: &Match,
         replacement: &str,
     ) -> Result<()> {
         match self.print_mode {
@@ -249,7 +249,7 @@ impl<'a, W: WriteColor> MatchFormatter<'a, W> {
     fn display_match_compact(
         &mut self,
         path: &Path,
-        search_match: &SearchMatch,
+        search_match: &Match,
         replacement: &str,
     ) -> Result<()> {
         let path = path.display();
@@ -277,7 +277,7 @@ impl<'a, W: WriteColor> MatchFormatter<'a, W> {
     }
 
     #[inline]
-    fn display_match_full(&mut self, m: &SearchMatch, replacement: &str) -> Result<()> {
+    fn display_match_full(&mut self, m: &Match, replacement: &str) -> Result<()> {
         let has_line_break = self
             .last_line_num
             .map(|last_line_num| {
@@ -349,137 +349,6 @@ impl<'a, W: WriteColor> MatchFormatter<'a, W> {
     }
 }
 
-#[derive(Debug)]
-struct SearchMatch {
-    line: Line,
-    context_pre: Vec<Line>,
-    context_post: Vec<Line>,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum MatchState {
-    Init,
-    Before,
-    Match,
-    After,
-}
-
-#[derive(Debug)]
-struct SearchMatchCollector {
-    state: MatchState,
-
-    cur_context_pre: Vec<Line>,
-    cur_context_post: Vec<Line>,
-    cur_match_line: Option<Line>,
-
-    matches: Vec<SearchMatch>,
-}
-
-impl SearchMatchCollector {
-    fn new() -> SearchMatchCollector {
-        SearchMatchCollector {
-            state: MatchState::Init,
-            cur_match_line: None,
-            cur_context_pre: Vec::new(),
-            cur_context_post: Vec::new(),
-            matches: Vec::new(),
-        }
-    }
-
-    fn maybe_emit(&mut self) {
-        let mut cur_match_line = None;
-        std::mem::swap(&mut cur_match_line, &mut self.cur_match_line);
-
-        if let Some(line) = cur_match_line {
-            let mut context_pre = vec![];
-            let mut context_post = vec![];
-            std::mem::swap(&mut context_pre, &mut self.cur_context_pre);
-            std::mem::swap(&mut context_post, &mut self.cur_context_post);
-
-            let search_match = SearchMatch {
-                line,
-                context_pre,
-                context_post,
-            };
-
-            self.matches.push(search_match);
-            self.state = MatchState::Init;
-        }
-    }
-
-    #[inline]
-    fn transition(&mut self, next: MatchState) {
-        match (self.state, next) {
-            // Beginning a new match or ending a previous one
-            (MatchState::Match, MatchState::Before)       // Have before context, no after context
-            | (MatchState::Match, MatchState::Match)      // No before context, no after context
-            | (MatchState::After, MatchState::Before)     // Have before context, have after context
-            | (MatchState::After, MatchState::Match) => { // Have after context, no before context
-                self.maybe_emit();
-            }
-
-            (_prev, next) => {
-                self.state = next;
-            }
-        }
-    }
-
-    fn collect(&mut self) -> Vec<SearchMatch> {
-        self.maybe_emit();
-
-        let mut matches = vec![];
-        std::mem::swap(&mut self.matches, &mut matches);
-
-        matches
-    }
-}
-
-impl Sink for SearchMatchCollector {
-    type Error = std::io::Error;
-
-    fn matched(
-        &mut self,
-        _searcher: &Searcher,
-        mat: &SinkMatch<'_>,
-    ) -> Result<bool, std::io::Error> {
-        self.transition(MatchState::Match);
-
-        let line = Line(
-            mat.line_number().unwrap(),
-            String::from_utf8_lossy(mat.bytes()).to_string(),
-        );
-
-        self.cur_match_line = Some(line);
-
-        Ok(true)
-    }
-
-    fn context(
-        &mut self,
-        _searcher: &Searcher,
-        ctx: &SinkContext<'_>,
-    ) -> Result<bool, std::io::Error> {
-        let line = Line(
-            ctx.line_number().unwrap(),
-            String::from_utf8_lossy(ctx.bytes()).to_string(),
-        );
-
-        match *ctx.kind() {
-            SinkContextKind::Before => {
-                self.transition(MatchState::Before);
-                self.cur_context_pre.push(line);
-            }
-            SinkContextKind::After => {
-                self.transition(MatchState::After);
-                self.cur_context_post.push(line);
-            }
-            SinkContextKind::Other => {}
-        }
-
-        Ok(true)
-    }
-}
-
 struct RegexReplacer {
     matcher: RegexMatcher,
     template: String,
@@ -510,25 +379,8 @@ impl RegexReplacer {
 }
 
 struct MatchReplacement<'a> {
-    search_match: SearchMatch,
+    search_match: Match,
     replacement: Cow<'a, str>,
-}
-
-struct SearchProcessor {
-    searcher: Searcher,
-    matcher: Arc<RegexMatcher>,
-}
-
-impl SearchProcessor {
-    fn search_path(&mut self, path: &'_ Path) -> Result<Vec<SearchMatch>> {
-        let mut collector = SearchMatchCollector::new();
-
-        self.searcher
-            .search_path(self.matcher.as_ref(), path, &mut collector)?;
-
-        let matches = collector.collect();
-        Ok(matches)
-    }
 }
 
 struct MatchProcessor {
@@ -550,7 +402,7 @@ impl MatchProcessor {
     fn consume_matches<W: WriteColor>(
         &mut self,
         path: &Path,
-        matches: Vec<SearchMatch>,
+        matches: Vec<Match>,
         match_formatter: &mut MatchFormatter<W>,
     ) -> Result<bool> {
         if matches.is_empty() {
@@ -742,7 +594,7 @@ struct FindAndReplacer {
     path_matcher: PathMatcher,
     match_formatter: MatchFormatterBuilder,
     match_processor_factory: Box<dyn Fn() -> MatchProcessor>,
-    searcher_factory: Box<dyn Fn() -> SearchProcessor + Sync>,
+    searcher_builder: RegexSearcherBuilder,
 }
 
 const DEFAULT_BEFORE_CONTEXT_LINES: usize = 2;
@@ -804,15 +656,6 @@ impl FindAndReplacer {
                     .unwrap_or(DEFAULT_AFTER_CONTEXT_LINES),
             );
 
-        let searcher_factory = {
-            let matcher = Arc::new(pattern_matcher);
-
-            Box::new(move || SearchProcessor {
-                matcher: matcher.clone(),
-                searcher: searcher_builder.build(),
-            })
-        };
-
         let paths = if config.paths.is_empty() {
             // Read paths from standard in if none are specified and
             // there's input piped to the process.
@@ -866,11 +709,13 @@ impl FindAndReplacer {
             excluded_paths,
         };
 
+        let searcher_builder = RegexSearcherBuilder::new(searcher_builder, pattern_matcher);
+
         Ok(FindAndReplacer {
             config,
             file_walker,
             path_matcher,
-            searcher_factory,
+            searcher_builder,
             match_processor_factory,
             match_formatter,
         })
@@ -891,7 +736,7 @@ impl FindAndReplacer {
             let path_matcher = &self.path_matcher;
             let match_formatter = &self.match_formatter;
 
-            let mut searcher = (self.searcher_factory)();
+            let mut searcher = self.searcher_builder.build();
             let mut match_processor = (self.match_processor_factory)();
 
             Box::new(move |dir_entry| {
