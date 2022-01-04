@@ -155,19 +155,19 @@ impl RegexSearcher {
     }
 }
 
-pub struct RegexSearcherBuilder {
+pub struct RegexSearcherFactory {
     searcher_builder: grep::searcher::SearcherBuilder,
     pattern_matcher: Arc<RegexMatcher>,
 }
 
-impl RegexSearcherBuilder {
+impl RegexSearcherFactory {
     pub fn new(
         searcher_builder: grep::searcher::SearcherBuilder,
-        pattern_matcher: RegexMatcher,
-    ) -> RegexSearcherBuilder {
-        RegexSearcherBuilder {
+        pattern_matcher: Arc<RegexMatcher>,
+    ) -> RegexSearcherFactory {
+        RegexSearcherFactory {
             searcher_builder,
-            pattern_matcher: Arc::new(pattern_matcher),
+            pattern_matcher,
         }
     }
 

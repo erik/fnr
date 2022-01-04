@@ -1,26 +1,24 @@
-use std::borrow::Cow;
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use atty::Stream;
-use grep::matcher::{Captures, Matcher};
-use grep::regex::{RegexMatcher, RegexMatcherBuilder};
+use grep::regex::RegexMatcherBuilder;
 use grep::searcher::{BinaryDetection, SearcherBuilder};
 use ignore::{WalkBuilder, WalkState};
 use regex::RegexSet;
 use structopt::clap::arg_enum;
 use structopt::StructOpt;
-use termcolor::{BufferWriter, ColorChoice, WriteColor};
-use text_io::read;
+use termcolor::{BufferWriter, ColorChoice};
 
 mod printer;
+mod replace;
 mod search;
 
-use crate::printer::{MatchPrinter, MatchPrinterBuilder};
-use crate::search::{Match, RegexSearcherBuilder};
+use crate::printer::MatchPrinterBuilder;
+use crate::replace::{ReplacementDecider, ReplacementDecision, ReplacerFactory};
+use crate::search::RegexSearcherFactory;
 
 arg_enum! {
     #[derive(Debug)]
@@ -59,6 +57,10 @@ impl ColorPreference {
 // /// Save changes as a .patch file rather than modifying in place.
 // #[structopt(long)]
 // write_patch: bool
+//
+// /// Match FIND only at word boundary.
+// #[structopt(short, long)]
+// word: bool
 pub struct Config {
     /// Match case insensitively.
     #[structopt(short = "i", long, conflicts_with = "case_sensitive, smart_case")]
@@ -89,10 +91,6 @@ pub struct Config {
     /// Modify files in place.
     #[structopt(short = "W", long, conflicts_with = "prompt")]
     write: bool,
-
-    /// Match FIND only at word boundary.
-    #[structopt(short, long)]
-    word: bool,
 
     /// Treat FIND as a string rather than a regular expression.
     #[structopt(long)]
@@ -164,256 +162,16 @@ pub struct Config {
 
 impl Config {}
 
-struct RegexReplacer {
-    matcher: RegexMatcher,
-    template: String,
-}
-
-impl RegexReplacer {
-    fn replace(&self, input: &str) -> Result<String> {
-        let mut caps = self.matcher.new_captures().unwrap();
-        let mut dst = vec![];
-
-        self.matcher.replace_with_captures(
-            input.as_bytes(),
-            &mut caps,
-            &mut dst,
-            |caps, dst| {
-                caps.interpolate(
-                    |name| self.matcher.capture_index(name),
-                    input.as_bytes(),
-                    self.template.as_bytes(),
-                    dst,
-                );
-                true
-            },
-        )?;
-
-        Ok(String::from_utf8_lossy(&dst).to_string())
-    }
-}
-
-struct MatchReplacement<'a> {
-    search_match: Match,
-    replacement: Cow<'a, str>,
-}
-
-struct MatchProcessor {
-    replacer: Arc<RegexReplacer>,
-    replacement_decider: ReplacementDecider,
-}
-
-impl MatchProcessor {
-    fn new(
-        replacer: Arc<RegexReplacer>,
-        replacement_decider: ReplacementDecider,
-    ) -> MatchProcessor {
-        MatchProcessor {
-            replacer,
-            replacement_decider,
-        }
-    }
-
-    fn consume_matches<W: WriteColor>(
-        &mut self,
-        path: &Path,
-        matches: Vec<Match>,
-        match_printer: &mut MatchPrinter<W>,
-    ) -> Result<bool> {
-        if matches.is_empty() {
-            return Ok(true);
-        }
-
-        match_printer.display_header(path, matches.len())?;
-
-        self.replacement_decider.reset_local_decision();
-
-        let mut replacement_list = Vec::with_capacity(matches.len());
-        for m in matches.into_iter() {
-            let replacement = self.replacer.replace(&m.line.1)?;
-            match_printer.display_match(path, &m, &replacement)?;
-
-            let match_replacement = match self.replacement_decider.decide() {
-                ReplacementDecision::Accept => MatchReplacement {
-                    search_match: m,
-                    replacement: replacement.into(),
-                },
-                ReplacementDecision::Ignore => continue,
-                ReplacementDecision::Edit => {
-                    let mut line = read_input("Replace with [^D to skip] ")?;
-                    if line.is_empty() {
-                        println!("... skipped ...");
-                        continue;
-                    }
-
-                    line.push('\n');
-                    match_printer.display_match(path, &m, &line)?;
-                    println!("--");
-                    MatchReplacement {
-                        search_match: m,
-                        replacement: line.into(),
-                    }
-                }
-                ReplacementDecision::Terminate => {
-                    println!("exiting!");
-                    // TODO: represent this code more cleanly?
-                    return Ok(false);
-                }
-            };
-
-            replacement_list.push(match_replacement);
-        }
-
-        if !replacement_list.is_empty() {
-            self.apply_replacements(path, &replacement_list)?;
-        }
-
-        Ok(true)
-    }
-
-    fn apply_replacements(&self, path: &Path, mut replacements: &[MatchReplacement]) -> Result<()> {
-        let dst_path = path.with_extension("~");
-        let src = File::open(path)?;
-        let dst = File::create(&dst_path)?;
-
-        let mut reader = BufReader::new(src);
-        let mut writer = BufWriter::new(dst);
-
-        let mut line_num = 0;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let bytes_read = reader.read_line(&mut line)?;
-            // EOF reached
-            if bytes_read == 0 {
-                break;
-            }
-
-            line_num += 1;
-
-            if !replacements.is_empty() && replacements[0].search_match.line.0 == line_num {
-                writer.write_all(replacements[0].replacement.as_bytes())?;
-                replacements = &replacements[1..];
-            } else {
-                writer.write_all(line.as_bytes())?;
-            }
-        }
-
-        if !replacements.is_empty() {
-            panic!("reached EOF with remaining replacements");
-        }
-
-        std::fs::rename(dst_path, path)?;
-        Ok(())
-    }
-
-    fn finalize(&self) -> Result<()> {
-        Ok(())
-        // match_printer
-        //     .display_footer(self.total_replacements, self.total_matches)
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-enum ReplacementDecision {
-    Accept,
-    Ignore,
-    Edit,
-    Terminate,
-}
-
-fn read_input(prompt: &str) -> Result<String, std::io::Error> {
-    print!("{}", prompt);
-    std::io::stdout().flush()?;
-
-    Ok(read!("{}\n"))
-}
-
-#[derive(Clone, Copy)]
-struct ReplacementDecider {
-    should_prompt: bool,
-    global_decision: Option<ReplacementDecision>,
-    local_decision: Option<ReplacementDecision>,
-}
-
-impl ReplacementDecider {
-    fn new(
-        should_prompt: bool,
-        global_decision: Option<ReplacementDecision>,
-    ) -> ReplacementDecider {
-        ReplacementDecider {
-            global_decision,
-            should_prompt,
-            local_decision: None,
-        }
-    }
-
-    fn reset_local_decision(&mut self) {
-        self.local_decision = None;
-    }
-
-    fn decide(&mut self) -> ReplacementDecision {
-        if let Some(global_decision) = self.global_decision {
-            return global_decision;
-        } else if let Some(local_decision) = self.local_decision {
-            return local_decision;
-        }
-
-        if !self.should_prompt {
-            panic!("[bug] invalid state: no decision, but should not prompt");
-        }
-
-        self.prompt_for_decision()
-    }
-
-    fn prompt_for_decision(&mut self) -> ReplacementDecision {
-        loop {
-            let line = read_input("Stage this replacement [y,n,q,a,e,d,?] ").unwrap();
-
-            return match line.as_str() {
-                "y" => ReplacementDecision::Accept,
-                "n" => ReplacementDecision::Ignore,
-                "q" => ReplacementDecision::Terminate,
-                "a" => {
-                    self.local_decision = Some(ReplacementDecision::Accept);
-                    ReplacementDecision::Accept
-                }
-                "d" => {
-                    self.local_decision = Some(ReplacementDecision::Ignore);
-                    ReplacementDecision::Ignore
-                }
-                "e" => ReplacementDecision::Edit,
-
-                _ => {
-                    println!(
-                        "\x1B[31m
-Y - replace this line
-n - do not replace this line
-q - quit; do not replace this line or any remaining ones
-a - replace this line and all remaining ones in this file
-d - do not replace this line nor any remaining ones in this file
-e - edit this replacement
-? - show help
-\x1B[0m"
-                    );
-                    continue;
-                }
-            };
-        }
-    }
-}
-
 struct FindAndReplacer {
     config: Config,
     file_walker: WalkBuilder,
     path_matcher: PathMatcher,
     match_printer: MatchPrinterBuilder,
-    match_processor_factory: Box<dyn Fn() -> MatchProcessor>,
-    searcher_builder: RegexSearcherBuilder,
+    replacer_factory: ReplacerFactory,
+    searcher_factory: RegexSearcherFactory,
 }
 
-const DEFAULT_BEFORE_CONTEXT_LINES: usize = 2;
-const DEFAULT_AFTER_CONTEXT_LINES: usize = 2;
+const DEFAULT_CONTEXT_LINES: usize = 2;
 
 impl FindAndReplacer {
     fn from_config(config: Config) -> Result<FindAndReplacer> {
@@ -423,36 +181,30 @@ impl FindAndReplacer {
             config.find.to_owned()
         };
 
-        let pattern_matcher = RegexMatcherBuilder::new()
-            .case_insensitive(!config.case_sensitive && config.ignore_case)
-            .case_smart(!config.case_sensitive && config.smart_case.unwrap_or(true))
-            .build(&pattern)
-            .with_context(|| format!("Failed to parse pattern '{}'", pattern))?;
-
-        // TODO: Confirm that template does not reference more capture groups than exist.
-        let replacer = RegexReplacer {
-            matcher: pattern_matcher.clone(),
-            template: config.replace.to_owned(),
-        };
+        let pattern_matcher = Arc::new(
+            RegexMatcherBuilder::new()
+                .case_insensitive(!config.case_sensitive && config.ignore_case)
+                .case_smart(!config.case_sensitive && config.smart_case.unwrap_or(true))
+                .build(&pattern)
+                .with_context(|| format!("Failed to parse pattern '{}'", pattern))?,
+        );
 
         let match_printer = MatchPrinterBuilder::from_config(&config);
 
-        let match_processor_factory = {
-            let replacer = Arc::new(replacer);
-
-            let global_replacement_decision = if config.prompt {
-                None
-            } else if config.write {
-                Some(ReplacementDecision::Accept)
-            } else {
-                Some(ReplacementDecision::Ignore)
-            };
-
-            let replacement_decider =
-                ReplacementDecider::new(config.prompt, global_replacement_decision);
-
-            Box::new(move || MatchProcessor::new(replacer.clone(), replacement_decider))
+        let replacement_decider = if config.prompt {
+            ReplacementDecider::with_prompt()
+        } else if config.write {
+            ReplacementDecider::constantly(ReplacementDecision::Accept)
+        } else {
+            ReplacementDecider::constantly(ReplacementDecision::Ignore)
         };
+
+        // TODO: Confirm that template does not reference more capture groups than exist.
+        let replacer_factory = ReplacerFactory::new(
+            pattern_matcher.clone(),
+            Arc::new(config.replace.to_owned()),
+            replacement_decider,
+        );
 
         let mut searcher_builder = SearcherBuilder::new();
         searcher_builder
@@ -462,14 +214,15 @@ impl FindAndReplacer {
                 config
                     .before
                     .or(config.context)
-                    .unwrap_or(DEFAULT_BEFORE_CONTEXT_LINES),
+                    .unwrap_or(DEFAULT_CONTEXT_LINES),
             )
             .after_context(
                 config
                     .after
                     .or(config.context)
-                    .unwrap_or(DEFAULT_AFTER_CONTEXT_LINES),
+                    .unwrap_or(DEFAULT_CONTEXT_LINES),
             );
+        let searcher_factory = RegexSearcherFactory::new(searcher_builder, pattern_matcher);
 
         let paths = if config.paths.is_empty() {
             // Read paths from standard in if none are specified and
@@ -524,14 +277,12 @@ impl FindAndReplacer {
             excluded_paths,
         };
 
-        let searcher_builder = RegexSearcherBuilder::new(searcher_builder, pattern_matcher);
-
         Ok(FindAndReplacer {
             config,
             file_walker,
             path_matcher,
-            searcher_builder,
-            match_processor_factory,
+            searcher_factory,
+            replacer_factory,
             match_printer,
         })
     }
@@ -551,8 +302,8 @@ impl FindAndReplacer {
             let path_matcher = &self.path_matcher;
             let match_printer = &self.match_printer;
 
-            let mut searcher = self.searcher_builder.build();
-            let mut match_processor = (self.match_processor_factory)();
+            let mut searcher = self.searcher_factory.build();
+            let mut replacer = self.replacer_factory.build();
 
             Box::new(move |dir_entry| {
                 let path = match dir_entry {
@@ -587,8 +338,7 @@ impl FindAndReplacer {
                 let mut buffer = buf_writer.buffer();
                 let mut match_printer = match_printer.build(&mut buffer);
 
-                let should_proceed =
-                    match_processor.consume_matches(path, matches, &mut match_printer);
+                let should_proceed = replacer.consume_matches(path, matches, &mut match_printer);
 
                 if let Err(err) = buf_writer.print(&buffer) {
                     if err.kind() == std::io::ErrorKind::BrokenPipe {
