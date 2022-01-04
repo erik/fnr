@@ -43,10 +43,7 @@ arg_enum! {
 // #[structopt(long)]
 // write_patch: bool
 //
-// /// Match FIND only at word boundary.
-// #[structopt(short, long)]
-// word: bool
-pub struct Config {
+struct Config {
     /// Match case insensitively.
     #[structopt(short = "i", long, conflicts_with = "case_sensitive, smart_case")]
     ignore_case: bool,
@@ -78,8 +75,12 @@ pub struct Config {
     write: bool,
 
     /// Treat FIND as a string rather than a regular expression.
-    #[structopt(long)]
+    #[structopt(short = "Q", long)]
     literal: bool,
+
+    /// Match FIND only at word boundary.
+    #[structopt(short, long)]
+    word: bool,
 
     /// Search ALL files in given paths for matches.
     #[structopt(short, long, conflicts_with = "hidden")]
@@ -177,6 +178,7 @@ impl Config {
         RegexMatcherBuilder::new()
             .case_insensitive(!self.case_sensitive && self.ignore_case)
             .case_smart(!self.case_sensitive && self.smart_case.unwrap_or(true))
+            .word(self.word)
             .build(&pattern)
             .with_context(|| format!("Failed to parse pattern '{}'", pattern))
     }

@@ -329,3 +329,26 @@ fn test_simple_replace_exclude_disallowlist() {
         "replaced"
     );
 }
+
+#[test]
+fn test_replace_at_word_boundary() {
+    let orig_content = "foo\nfooBar\n(foo)\nfoob\n";
+    let test_dir = create_test_files(&[("a", orig_content)]);
+
+    Command::cargo_bin("fnr")
+        .unwrap()
+        .args(&[
+            "foo",
+            "bar",
+            "--word",
+            "--write",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        read_to_string(test_dir.path().join("a")).unwrap(),
+        "bar\nfooBar\n(bar)\nfoob\n"
+    );
+}
