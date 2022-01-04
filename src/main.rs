@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
@@ -27,6 +28,43 @@ arg_enum! {
         Always,
         Auto,
         Never
+    }
+}
+
+#[derive(Debug)]
+struct Statistics {
+    files_total: AtomicUsize,
+    files_checked: AtomicUsize,
+    files_ignored: AtomicUsize,
+    files_with_match: AtomicUsize,
+    num_matches: AtomicUsize,
+}
+
+impl Statistics {
+    fn new() -> Statistics {
+        Statistics {
+            files_total: 0.into(),
+            files_checked: 0.into(),
+            files_ignored: 0.into(),
+            files_with_match: 0.into(),
+            num_matches: 0.into(),
+        }
+    }
+
+    #[inline]
+    fn visit_file(&self, checked: bool) {
+        self.files_total.fetch_add(1, Ordering::Relaxed);
+        if checked {
+            self.files_checked.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.files_ignored.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn add_matches(&self, num_matches: usize) {
+        self.files_with_match.fetch_add(1, Ordering::Relaxed);
+        self.num_matches.fetch_add(num_matches, Ordering::Relaxed);
     }
 }
 
@@ -328,22 +366,29 @@ impl FindAndReplacer {
 
     fn run_parallel(&mut self) -> Result<()> {
         let writer = BufferWriter::stdout(self.config.color_choice());
+        let stats = Arc::new(Statistics::new());
 
         let file_walker = self.file_walker.build_parallel();
         file_walker.run(|| {
             let writer = &writer;
             let path_matcher = &self.path_matcher;
             let match_printer = &self.match_printer;
+            let stats = &stats;
 
             let mut searcher = self.searcher_factory.build();
             let mut replacer = self.replacer_factory.build();
 
             Box::new(move |dir_entry| {
                 let path = match dir_entry {
-                    Ok(ref ent) if ent.file_type().map_or(false, |it| it.is_file()) => ent.path(),
-                    Ok(_) => {
-                        return WalkState::Continue;
+                    Ok(ref ent) => {
+                        // Don't need to consider directories
+                        if ent.file_type().map_or(false, |it| it.is_file()) {
+                            ent.path()
+                        } else {
+                            return WalkState::Continue;
+                        }
                     }
+
                     Err(err) => {
                         eprintln!("error: {}", err);
                         return WalkState::Continue;
@@ -351,16 +396,23 @@ impl FindAndReplacer {
                 };
 
                 if !path_matcher.is_match(path) {
+                    stats.visit_file(false);
                     return WalkState::Continue;
                 }
 
-                let matches = match searcher.search_path(path) {
-                    // No futher processing required for empty matches.
-                    Ok(m) if m.is_empty() => {
-                        return WalkState::Continue;
-                    }
+                stats.visit_file(true);
 
-                    Ok(m) => m,
+                let matches = match searcher.search_path(path) {
+                    Ok(matches) => {
+                        // No futher processing required for empty matches.
+                        if matches.is_empty() {
+                            return WalkState::Continue;
+                        } else {
+                            stats.add_matches(matches.len());
+                        }
+
+                        matches
+                    }
 
                     err => {
                         eprintln!("search failed: {:?}", err);
@@ -391,7 +443,12 @@ impl FindAndReplacer {
             })
         });
 
-        // self.match_processor.finalize()?;
+        // TODO:
+        // let mut buffer = writer.buffer();
+        // let mut match_printer = match_printer.build(&mut buffer);
+        // match_printer.print_footer(stats);
+
+        println!("{:?}", stats);
 
         Ok(())
     }
