@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use atty::Stream;
-use grep::regex::RegexMatcherBuilder;
+use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{BinaryDetection, SearcherBuilder};
 use ignore::{WalkBuilder, WalkState};
 use regex::RegexSet;
@@ -16,7 +17,7 @@ mod printer;
 mod replace;
 mod search;
 
-use crate::printer::MatchPrinterBuilder;
+use crate::printer::{MatchPrintMode, MatchPrinterBuilder};
 use crate::replace::{ReplacementDecider, ReplacementDecision, ReplacerFactory};
 use crate::search::RegexSearcherFactory;
 
@@ -26,22 +27,6 @@ arg_enum! {
         Always,
         Auto,
         Never
-    }
-}
-
-impl ColorPreference {
-    fn as_color_choice(&self) -> ColorChoice {
-        match *self {
-            ColorPreference::Always => ColorChoice::Always,
-            ColorPreference::Auto => {
-                if atty::is(Stream::Stdout) {
-                    ColorChoice::Auto
-                } else {
-                    ColorChoice::Never
-                }
-            }
-            ColorPreference::Never => ColorChoice::Never,
-        }
     }
 }
 
@@ -160,7 +145,143 @@ pub struct Config {
     paths: Vec<PathBuf>,
 }
 
-impl Config {}
+impl Config {
+    fn path_matcher(&self) -> Result<PathMatcher> {
+        let included_paths = self.include.as_ref().map(|included_paths| {
+            let escaped = included_paths.iter().map(|p| regex::escape(p));
+            RegexSet::new(escaped).unwrap()
+        });
+
+        let excluded_paths = {
+            let escaped = self.exclude.iter().map(|p| regex::escape(p));
+            RegexSet::new(escaped)?
+        };
+
+        Ok(PathMatcher {
+            included_paths,
+            excluded_paths,
+        })
+    }
+
+    fn pattern(&self) -> Cow<str> {
+        if self.literal {
+            regex::escape(&self.find).into()
+        } else {
+            self.find.as_str().into()
+        }
+    }
+
+    fn regex_matcher(&self) -> Result<RegexMatcher> {
+        let pattern = self.pattern();
+
+        RegexMatcherBuilder::new()
+            .case_insensitive(!self.case_sensitive && self.ignore_case)
+            .case_smart(!self.case_sensitive && self.smart_case.unwrap_or(true))
+            .build(&pattern)
+            .with_context(|| format!("Failed to parse pattern '{}'", pattern))
+    }
+
+    fn search_paths(&self) -> Result<Cow<[PathBuf]>> {
+        if !self.paths.is_empty() {
+            return Ok(Cow::from(&self.paths));
+        }
+
+        // Read paths from standard in if none are specified and
+        // there's input piped to the process.
+        //
+        // Otherwise, we just search the current directory.
+        let paths = if !atty::is(Stream::Stdin) {
+            ensure!(
+                !self.prompt,
+                "cannot use --prompt when reading files from stdin"
+            );
+            let mut paths = vec![];
+            for line in std::io::stdin().lock().lines() {
+                paths.push(PathBuf::from(line.unwrap()));
+            }
+            paths
+        } else {
+            vec![PathBuf::from(".")]
+        };
+
+        Ok(Cow::from(paths))
+    }
+
+    fn file_walker(&self) -> Result<WalkBuilder> {
+        let paths = self.search_paths()?;
+
+        let mut file_walker = WalkBuilder::new(&paths[0]);
+        for path in &paths[1..] {
+            file_walker.add(path);
+        }
+
+        // This is copied over from ripgrep, and seems to work well.
+        file_walker.threads(std::cmp::min(12, num_cpus::get()));
+
+        let should_ignore = !self.all_files;
+        let should_show_hidden = self.hidden || self.all_files;
+        file_walker
+            .hidden(!should_show_hidden)
+            .ignore(should_ignore)
+            .git_ignore(should_ignore)
+            .git_exclude(should_ignore)
+            .parents(should_ignore);
+
+        Ok(file_walker)
+    }
+
+    fn replacement_decider(&self) -> ReplacementDecider {
+        if self.prompt {
+            ReplacementDecider::with_prompt()
+        } else if self.write {
+            ReplacementDecider::constantly(ReplacementDecision::Accept)
+        } else {
+            ReplacementDecider::constantly(ReplacementDecision::Ignore)
+        }
+    }
+
+    fn searcher_builder(&self) -> SearcherBuilder {
+        let mut searcher_builder = SearcherBuilder::new();
+        searcher_builder
+            .binary_detection(BinaryDetection::quit(0x00))
+            .line_number(true)
+            .before_context(
+                self.before
+                    .or(self.context)
+                    .unwrap_or(DEFAULT_CONTEXT_LINES),
+            )
+            .after_context(self.after.or(self.context).unwrap_or(DEFAULT_CONTEXT_LINES));
+
+        searcher_builder
+    }
+
+    fn match_printer(&self) -> MatchPrinterBuilder {
+        MatchPrinterBuilder {
+            print_mode: if self.quiet {
+                MatchPrintMode::Silent
+            } else if self.compact {
+                MatchPrintMode::Compact
+            } else {
+                MatchPrintMode::Full
+            },
+            writes_enabled: self.write || self.prompt,
+        }
+    }
+
+    fn color_choice(&self) -> ColorChoice {
+        match self.color {
+            ColorPreference::Always => ColorChoice::Always,
+            ColorPreference::Auto => {
+                if atty::is(Stream::Stdout) {
+                    ColorChoice::Auto
+                } else {
+                    ColorChoice::Never
+                }
+            }
+            ColorPreference::Never => ColorChoice::Never,
+        }
+    }
+}
 
 struct FindAndReplacer {
     config: Config,
@@ -175,116 +296,25 @@ const DEFAULT_CONTEXT_LINES: usize = 2;
 
 impl FindAndReplacer {
     fn from_config(config: Config) -> Result<FindAndReplacer> {
-        let pattern = if config.literal {
-            regex::escape(&config.find)
-        } else {
-            config.find.to_owned()
-        };
-
-        let pattern_matcher = Arc::new(
-            RegexMatcherBuilder::new()
-                .case_insensitive(!config.case_sensitive && config.ignore_case)
-                .case_smart(!config.case_sensitive && config.smart_case.unwrap_or(true))
-                .build(&pattern)
-                .with_context(|| format!("Failed to parse pattern '{}'", pattern))?,
-        );
-
-        let match_printer = MatchPrinterBuilder::from_config(&config);
-
-        let replacement_decider = if config.prompt {
-            ReplacementDecider::with_prompt()
-        } else if config.write {
-            ReplacementDecider::constantly(ReplacementDecision::Accept)
-        } else {
-            ReplacementDecider::constantly(ReplacementDecision::Ignore)
-        };
+        let regex_matcher = Arc::new(config.regex_matcher()?);
 
         // TODO: Confirm that template does not reference more capture groups than exist.
         let replacer_factory = ReplacerFactory::new(
-            pattern_matcher.clone(),
+            regex_matcher.clone(),
             Arc::new(config.replace.to_owned()),
-            replacement_decider,
+            config.replacement_decider(),
         );
 
-        let mut searcher_builder = SearcherBuilder::new();
-        searcher_builder
-            .binary_detection(BinaryDetection::quit(0x00))
-            .line_number(true)
-            .before_context(
-                config
-                    .before
-                    .or(config.context)
-                    .unwrap_or(DEFAULT_CONTEXT_LINES),
-            )
-            .after_context(
-                config
-                    .after
-                    .or(config.context)
-                    .unwrap_or(DEFAULT_CONTEXT_LINES),
-            );
-        let searcher_factory = RegexSearcherFactory::new(searcher_builder, pattern_matcher);
-
-        let paths = if config.paths.is_empty() {
-            // Read paths from standard in if none are specified and
-            // there's input piped to the process.
-            if !atty::is(Stream::Stdin) {
-                ensure!(
-                    !config.prompt,
-                    "cannot use --prompt when reading files from stdin"
-                );
-                let mut paths = vec![];
-                for line in std::io::stdin().lock().lines() {
-                    paths.push(PathBuf::from(line.unwrap()));
-                }
-                paths
-            } else {
-                vec![PathBuf::from(".")]
-            }
-        } else {
-            // TODO: remove clone
-            config.paths.clone()
-        };
-
-        let mut file_walker = WalkBuilder::new(&paths[0]);
-        {
-            for path in &paths[1..] {
-                file_walker.add(path);
-            }
-
-            // This is copied over from ripgrep, and seems to work well.
-            file_walker.threads(std::cmp::min(12, num_cpus::get()));
-
-            let should_ignore = !config.all_files;
-            let should_show_hidden = config.hidden || config.all_files;
-            file_walker
-                .hidden(!should_show_hidden)
-                .ignore(should_ignore)
-                .git_ignore(should_ignore)
-                .git_exclude(should_ignore)
-                .parents(should_ignore);
-        }
-
-        let included_paths = config.include.as_ref().map(|included_paths| {
-            let escaped = included_paths.iter().map(|p| regex::escape(p));
-            RegexSet::new(escaped).unwrap()
-        });
-        let excluded_paths = {
-            let escaped = config.exclude.iter().map(|p| regex::escape(p));
-            RegexSet::new(escaped)?
-        };
-
-        let path_matcher = PathMatcher {
-            included_paths,
-            excluded_paths,
-        };
+        let searcher_factory = RegexSearcherFactory::new(config.searcher_builder(), regex_matcher);
 
         Ok(FindAndReplacer {
-            config,
-            file_walker,
-            path_matcher,
+            file_walker: config.file_walker()?,
+            path_matcher: config.path_matcher()?,
+            match_printer: config.match_printer(),
             searcher_factory,
             replacer_factory,
-            match_printer,
+
+            config,
         })
     }
 
@@ -295,11 +325,11 @@ impl FindAndReplacer {
     }
 
     fn run_parallel(&mut self) -> Result<()> {
-        let buf_writer = BufferWriter::stdout(self.config.color.as_color_choice());
+        let writer = BufferWriter::stdout(self.config.color_choice());
 
         let file_walker = self.file_walker.build_parallel();
         file_walker.run(|| {
-            let buf_writer = &buf_writer;
+            let writer = &writer;
             let path_matcher = &self.path_matcher;
             let match_printer = &self.match_printer;
 
@@ -336,12 +366,12 @@ impl FindAndReplacer {
                     }
                 };
 
-                let mut buffer = buf_writer.buffer();
+                let mut buffer = writer.buffer();
                 let mut match_printer = match_printer.build(&mut buffer);
 
                 let should_proceed = replacer.consume_matches(path, matches, &mut match_printer);
 
-                if let Err(err) = buf_writer.print(&buffer) {
+                if let Err(err) = writer.print(&buffer) {
                     if err.kind() == std::io::ErrorKind::BrokenPipe {
                         return WalkState::Quit;
                     }

@@ -5,34 +5,20 @@ use anyhow::Result;
 use termcolor::{ColorSpec, WriteColor};
 
 use crate::search::Match;
-use crate::Config;
 
 #[derive(Copy, Clone)]
-enum MatchPrintMode {
+pub enum MatchPrintMode {
     Silent,
     Compact,
     Full,
 }
 
 pub struct MatchPrinterBuilder {
-    print_mode: MatchPrintMode,
-    writes_enabled: bool,
+    pub print_mode: MatchPrintMode,
+    pub writes_enabled: bool,
 }
 
 impl MatchPrinterBuilder {
-    pub fn from_config(cfg: &Config) -> MatchPrinterBuilder {
-        MatchPrinterBuilder {
-            print_mode: if cfg.quiet {
-                MatchPrintMode::Silent
-            } else if cfg.compact {
-                MatchPrintMode::Compact
-            } else {
-                MatchPrintMode::Full
-            },
-            writes_enabled: cfg.write || cfg.prompt,
-        }
-    }
-
     pub fn build<'a, W: WriteColor>(&self, writer: &'a mut W) -> MatchPrinter<'a, W> {
         MatchPrinter {
             writer,
