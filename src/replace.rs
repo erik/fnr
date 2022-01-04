@@ -71,39 +71,9 @@ impl ReplacementDecider {
     fn decide(&mut self) -> ReplacementDecision {
         match self {
             Self::Constantly(decision) => *decision,
-            Self::WithPrompt { local_decision } => loop {
-                let line = read_input("Stage this replacement [y,n,q,a,e,d,?] ").unwrap();
-
-                return match line.as_str() {
-                    "y" => ReplacementDecision::Accept,
-                    "n" => ReplacementDecision::Ignore,
-                    "q" => ReplacementDecision::Terminate,
-                    "a" => {
-                        *local_decision = Some(ReplacementDecision::Accept);
-                        ReplacementDecision::Accept
-                    }
-                    "d" => {
-                        *local_decision = Some(ReplacementDecision::Ignore);
-                        ReplacementDecision::Ignore
-                    }
-                    "e" => ReplacementDecision::Edit,
-
-                    _ => {
-                        println!(
-                            "\x1B[31m
-Y - replace this line
-n - do not replace this line
-q - quit; do not replace this line or any remaining ones
-a - replace this line and all remaining ones in this file
-d - do not replace this line nor any remaining ones in this file
-e - edit this replacement
-? - show help
-\x1B[0m"
-                        );
-                        continue;
-                    }
-                };
-            },
+            Self::WithPrompt {
+                ref mut local_decision,
+            } => ReplacementDecider::prompt_for_decision(local_decision),
         }
     }
 
@@ -113,6 +83,44 @@ e - edit this replacement
             Self::WithPrompt { local_decision } => {
                 *local_decision = None;
             }
+        }
+    }
+
+    fn prompt_for_decision(
+        local_decision: &mut Option<ReplacementDecision>,
+    ) -> ReplacementDecision {
+        loop {
+            let line = read_input("Stage this replacement [y,n,q,a,e,d,?] ").unwrap();
+
+            return match line.as_str() {
+                "y" => ReplacementDecision::Accept,
+                "n" => ReplacementDecision::Ignore,
+                "q" => ReplacementDecision::Terminate,
+                "a" => {
+                    *local_decision = Some(ReplacementDecision::Accept);
+                    ReplacementDecision::Accept
+                }
+                "d" => {
+                    *local_decision = Some(ReplacementDecision::Ignore);
+                    ReplacementDecision::Ignore
+                }
+                "e" => ReplacementDecision::Edit,
+
+                _ => {
+                    println!(
+                        "\x1B[31m
+Y - replace this line
+n - do not replace this line
+q - quit; do not replace this line or any remaining ones
+a - replace this line and all remaining ones in this file
+d - do not replace this line nor any remaining ones in this file
+e - edit this replacement
+? - show help
+\x1B[0m"
+                    );
+                    continue;
+                }
+            };
         }
     }
 }

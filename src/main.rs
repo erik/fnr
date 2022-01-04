@@ -251,6 +251,7 @@ impl FindAndReplacer {
                 file_walker.add(path);
             }
 
+            // This is copied over from ripgrep, and seems to work well.
             file_walker.threads(std::cmp::min(12, num_cpus::get()));
 
             let should_ignore = !config.all_files;
