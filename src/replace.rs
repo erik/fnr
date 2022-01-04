@@ -18,6 +18,22 @@ struct MatchReplacement<'a> {
     replacement: Cow<'a, str>,
 }
 
+#[derive(Debug, Copy, Clone)]
+pub enum ReplacementDecision {
+    Accept,
+    Ignore,
+    Edit,
+    Terminate,
+}
+
+#[derive(Clone)]
+pub enum ReplacementDecider {
+    Constantly(ReplacementDecision),
+    WithPrompt {
+        local_decision: Option<ReplacementDecision>,
+    },
+}
+
 pub struct ReplacerFactory {
     regex_matcher: Arc<RegexMatcher>,
     replacement_template: Arc<String>,
@@ -47,14 +63,6 @@ impl ReplacerFactory {
             replacement_decider: self.replacement_decider.clone(),
         }
     }
-}
-
-#[derive(Clone)]
-pub enum ReplacementDecider {
-    Constantly(ReplacementDecision),
-    WithPrompt {
-        local_decision: Option<ReplacementDecision>,
-    },
 }
 
 impl ReplacementDecider {
@@ -104,6 +112,8 @@ impl ReplacementDecider {
                     *local_decision = Some(ReplacementDecision::Ignore);
                     ReplacementDecision::Ignore
                 }
+
+                // TODO: support opening editor at point
                 "e" => ReplacementDecision::Edit,
 
                 _ => {
@@ -146,7 +156,6 @@ impl Replacer {
 
         self.replacement_decider.reset();
 
-        // TODO: filter-map
         let mut replacement_list = Vec::with_capacity(matches.len());
         for m in matches.into_iter() {
             let replacement = self.replace_with_captures(&m.line.1)?;
@@ -184,13 +193,13 @@ impl Replacer {
         }
 
         if !replacement_list.is_empty() {
-            self.apply_replacements(path, &replacement_list)?;
+            self.apply(path, &replacement_list)?;
         }
 
         Ok(true)
     }
 
-    fn apply_replacements(&self, path: &Path, mut replacements: &[MatchReplacement]) -> Result<()> {
+    fn apply(&self, path: &Path, mut replacements: &[MatchReplacement]) -> Result<()> {
         let dst_path = path.with_extension("~");
         let src = File::open(path)?;
         let dst = File::create(&dst_path)?;
@@ -210,12 +219,20 @@ impl Replacer {
 
             line_num += 1;
 
-            if !replacements.is_empty() && replacements[0].search_match.line.0 == line_num {
-                writer.write_all(replacements[0].replacement.as_bytes())?;
+            let line_has_replacement = replacements
+                .first()
+                .map(|it| it.search_match.line.0 == line_num)
+                .unwrap_or(false);
+
+            let new_line = if line_has_replacement {
+                let repl = replacements[0].replacement.as_bytes();
                 replacements = &replacements[1..];
+                repl
             } else {
-                writer.write_all(line.as_bytes())?;
-            }
+                line.as_bytes()
+            };
+
+            writer.write_all(new_line)?;
         }
 
         if !replacements.is_empty() {
@@ -253,14 +270,6 @@ impl Replacer {
         // match_printer
         //     .display_footer(self.total_replacements, self.total_matches)
     }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub enum ReplacementDecision {
-    Accept,
-    Ignore,
-    Edit,
-    Terminate,
 }
 
 // TODO: global mutex.
