@@ -7,6 +7,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use grep::matcher::{Captures, Matcher};
 use grep::regex::RegexMatcher;
+use tempfile::NamedTempFile;
 use termcolor::WriteColor;
 use text_io::read;
 
@@ -204,12 +205,11 @@ impl Replacer {
     }
 
     fn apply(&self, path: &Path, mut replacements: &[MatchReplacement]) -> Result<usize> {
-        let dst_path = path.with_extension("~");
         let src = File::open(path)?;
-        let dst = File::create(&dst_path)?;
+        let dst_file = NamedTempFile::new()?;
 
         let mut reader = BufReader::new(src);
-        let mut writer = BufWriter::new(dst);
+        let mut writer = BufWriter::new(&dst_file);
 
         let mut line_num = 0;
         let mut line = String::new();
@@ -245,7 +245,8 @@ impl Replacer {
             panic!("reached EOF with remaining replacements");
         }
 
-        std::fs::rename(dst_path, path)?;
+        drop(writer);
+        dst_file.persist(path)?;
         Ok(num_replaced)
     }
 
