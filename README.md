@@ -86,18 +86,19 @@ $ cargo install --path .
 ## Performance
 
 Built on top of [ripgrep]'s path traversal and pattern matching, so
-even though performance isn't an explicit goal, it's fast enough to
-not be the bottleneck.
+even though performance isn't an explicit goal, it's not going to be
+the bottleneck.
 
-Even when comparing against tools which don't do any replacement,
-`fnr` still performs well.
+In fact, without writing changes back to files, it's imperceptibly
+slower than ripgrep itself.
 
-| Command                              |       Mean [s] | Min [s] | Max [s] |     Relative |
-|:-------------------------------------|---------------:|--------:|--------:|-------------:|
-| `rg "EINVAL" ./linux`                |  0.456 ± 0.005 |   0.448 |   0.463 |         1.00 |
-| `fnr "EINVAL" "ERR_INVALID" ./linux` |  1.521 ± 0.010 |   1.511 |   1.545 |  3.33 ± 0.04 |
-| `ag "EINVAL" ./linux`                |  2.457 ± 0.018 |   2.432 |   2.487 |  5.38 ± 0.07 |
-| `grep -irI "EINVAL" ./linux`         | 29.515 ± 0.382 |  29.133 |  30.193 | 64.68 ± 1.07 |
+| Command                                      |        Mean [ms] | Min [ms] | Max [ms] |      Relative |
+|:---------------------------------------------|-----------------:|---------:|---------:|--------------:|
+| `rg "EINVAL" ./linux`                        |     510.4 ± 25.8 |    467.6 |    555.0 |          1.00 |
+| `fnr "EINVAL" "ERR_INVALID" ./linux`         |     620.4 ± 22.1 |    573.7 |    649.7 |   1.22 ± 0.08 |
+| `fnr --write "EINVAL" "ERR_INVALID" ./linux` |    3629.0 ± 76.2 |   3538.0 |   3802.3 |   7.11 ± 0.39 |
+| `ag "EINVAL" ./linux`                        |    2560.0 ± 43.6 |   2518.4 |   2668.1 |   5.02 ± 0.27 |
+| `grep -irI "EINVAL" ./linux`                 | 37215.8 ± 7444.7 |  31316.1 |  49096.6 | 72.92 ± 15.04 |
 
 [ripgrep]: https://github.com/BurntSushi/ripgrep
 
