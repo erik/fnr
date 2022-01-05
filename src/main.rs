@@ -10,7 +10,7 @@ use anyhow::{ensure, Context, Result};
 use atty::Stream;
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{BinaryDetection, SearcherBuilder};
-use ignore::{WalkBuilder, WalkState};
+use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex::RegexSet;
 use structopt::clap::arg_enum;
 use structopt::StructOpt;
@@ -461,13 +461,13 @@ impl FindAndReplacer {
                 let _search_timer = stats.search_timer();
 
                 let path = match dir_entry {
-                    Ok(ref ent) => {
-                        // Don't need to consider directories
-                        if ent.file_type().map_or(false, |it| it.is_file()) {
-                            ent.path()
-                        } else {
+                    Ok(ref entry) => {
+                        if !path_matcher.should_search(entry) {
+                            stats.visit_file(false);
                             return WalkState::Continue;
                         }
+
+                        entry.path()
                     }
 
                     Err(err) => {
@@ -475,11 +475,6 @@ impl FindAndReplacer {
                         return WalkState::Continue;
                     }
                 };
-
-                if !path_matcher.is_match(path) {
-                    stats.visit_file(false);
-                    return WalkState::Continue;
-                }
 
                 stats.visit_file(true);
 
@@ -548,7 +543,14 @@ struct PathMatcher {
 }
 
 impl PathMatcher {
-    fn is_match(&self, path: &Path) -> bool {
+    fn should_search(&self, dir_entry: &DirEntry) -> bool {
+        // Don't need to consider directories
+        let is_file = dir_entry.file_type().map_or(false, |it| it.is_file());
+
+        is_file && self.path_matches(dir_entry.path())
+    }
+
+    fn path_matches(&self, path: &Path) -> bool {
         let path_str = path
             .to_str()
             .with_context(|| format!("Failed to interpret path name as UTF-8 string: {:?}", path))
@@ -602,7 +604,7 @@ mod tests {
                 excluded_paths: as_regex_set(disallow_list),
             };
 
-            assert_eq!(matcher.is_match(&Path::new("foo")), true);
+            assert_eq!(matcher.path_matches(&Path::new("foo")), true);
         }
 
         #[test]
@@ -615,9 +617,9 @@ mod tests {
                 excluded_paths: as_regex_set(disallow_list),
             };
 
-            assert_eq!(matcher.is_match(&Path::new("foo.rs")), true);
-            assert_eq!(matcher.is_match(&Path::new("bar.rs")), true);
-            assert_eq!(matcher.is_match(&Path::new("baz.rs")), false);
+            assert_eq!(matcher.path_matches(&Path::new("foo.rs")), true);
+            assert_eq!(matcher.path_matches(&Path::new("bar.rs")), true);
+            assert_eq!(matcher.path_matches(&Path::new("baz.rs")), false);
         }
 
         #[test]
@@ -628,9 +630,9 @@ mod tests {
                 excluded_paths: as_regex_set(disallow_list),
             };
 
-            assert_eq!(matcher.is_match(&Path::new("foo.rs")), false);
-            assert_eq!(matcher.is_match(&Path::new("bar.rs")), false);
-            assert_eq!(matcher.is_match(&Path::new("baz.rs")), true);
+            assert_eq!(matcher.path_matches(&Path::new("foo.rs")), false);
+            assert_eq!(matcher.path_matches(&Path::new("bar.rs")), false);
+            assert_eq!(matcher.path_matches(&Path::new("baz.rs")), true);
         }
 
         // Inclusion should take precedence
@@ -644,9 +646,9 @@ mod tests {
                 excluded_paths: as_regex_set(disallow_list),
             };
 
-            assert_eq!(matcher.is_match(&Path::new("foo.rs")), true);
-            assert_eq!(matcher.is_match(&Path::new("bar.rs")), true);
-            assert_eq!(matcher.is_match(&Path::new("baz.rs")), false);
+            assert_eq!(matcher.path_matches(&Path::new("foo.rs")), true);
+            assert_eq!(matcher.path_matches(&Path::new("bar.rs")), true);
+            assert_eq!(matcher.path_matches(&Path::new("baz.rs")), false);
         }
     }
 }
