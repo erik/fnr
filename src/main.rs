@@ -130,8 +130,7 @@ total files             {files_total:?}
   ... ignored           {files_ignored:?}
   ... searched          {files_searched:?}
   ... with matches      {files_with_matches:?}
-  ... with replacements {files_with_replacements:?}
-",
+  ... with replacements {files_with_replacements:?}",
             wall_time_secs =
                 Duration::from_nanos(self.wall_time_ns.load(Ordering::Relaxed)).as_secs_f32(),
             search_time_secs =
@@ -230,7 +229,7 @@ struct Config {
     #[structopt(short = "E", long)]
     exclude: Vec<String>,
 
-    /// Control whether terminal output is in color
+    /// Control whether terminal output is in color.
     #[structopt(
         long,
         possible_values = &ColorPreference::variants(),
@@ -238,6 +237,10 @@ struct Config {
         default_value = "auto"
     )]
     color: ColorPreference,
+
+    /// Print debug statistics about match.
+    #[structopt(long = "stats")]
+    print_stats: bool,
 
     /// What to search for. Literal string or regular expression.
     ///
@@ -483,10 +486,9 @@ impl FindAndReplacer {
                         // No futher processing required for empty matches.
                         if matches.is_empty() {
                             return WalkState::Continue;
-                        } else {
-                            stats.add_matches(matches.len());
                         }
 
+                        stats.add_matches(matches.len());
                         matches
                     }
 
@@ -523,15 +525,16 @@ impl FindAndReplacer {
             })
         });
 
-        let elapsed = start_time.elapsed();
-        stats.add_elapsed_wall_time(elapsed);
+        stats.add_elapsed_wall_time(start_time.elapsed());
 
         // TODO:
         // let mut buffer = writer.buffer();
         // let mut match_printer = match_printer.build(&mut buffer);
         // match_printer.print_footer(stats);
 
-        println!("{}", stats);
+        if self.config.print_stats {
+            println!("{}", stats);
+        }
 
         Ok(())
     }
