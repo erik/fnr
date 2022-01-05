@@ -81,7 +81,8 @@ impl ReplacementDecider {
             Self::Constantly(decision) => *decision,
             Self::WithPrompt {
                 ref mut local_decision,
-            } => ReplacementDecider::prompt_for_decision(local_decision),
+            } => local_decision
+                .unwrap_or_else(|| ReplacementDecider::prompt_for_decision(local_decision)),
         }
     }
 
