@@ -1,10 +1,11 @@
-use assert_cmd::Command;
 use std::fs::{read_to_string, File};
 use std::io::Write;
-use tempdir::TempDir;
+
+use assert_cmd::Command;
+use tempfile::TempDir;
 
 fn create_test_files<'a>(files: impl IntoIterator<Item = &'a (&'a str, &'a str)>) -> TempDir {
-    let test_dir = TempDir::new("fnr-integration-test").unwrap();
+    let test_dir = tempfile::tempdir().unwrap();
     for (name, contents) in files {
         let path = test_dir.path().join(name);
         let mut file = File::create(path).unwrap();
