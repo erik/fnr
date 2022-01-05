@@ -269,12 +269,6 @@ impl Replacer {
 
         Ok(String::from_utf8_lossy(&dst).to_string())
     }
-
-    fn finalize(&self) -> Result<()> {
-        Ok(())
-        // match_printer
-        //     .display_footer(self.total_replacements, self.total_matches)
-    }
 }
 
 // TODO: global mutex.

@@ -5,6 +5,7 @@ use anyhow::Result;
 use termcolor::{ColorSpec, WriteColor};
 
 use crate::search::Match;
+use crate::Statistics;
 
 #[derive(Copy, Clone)]
 pub enum MatchPrintMode {
@@ -149,28 +150,21 @@ impl<'a, W: WriteColor> MatchPrinter<'a, W> {
         Ok(())
     }
 
-    pub fn display_footer(
-        &mut self,
-        total_replacements: usize,
-        total_matches: usize,
-    ) -> Result<()> {
+    pub fn display_footer(&mut self, stats: &Statistics) -> Result<()> {
         match self.print_mode {
             MatchPrintMode::Silent => Ok(()),
             MatchPrintMode::Compact => Ok(()),
-            MatchPrintMode::Full => self.display_footer_full(total_replacements, total_matches),
+            MatchPrintMode::Full => self.display_footer_full(stats),
         }
     }
 
     #[inline]
-    fn display_footer_full(
-        &mut self,
-        total_replacements: usize,
-        total_matches: usize,
-    ) -> Result<()> {
+    fn display_footer_full(&mut self, stats: &Statistics) -> Result<()> {
         writeln!(
             &mut self.writer,
             "All done. Replaced {} of {} matches",
-            total_replacements, total_matches
+            stats.num_replacements(),
+            stats.num_matches(),
         )?;
 
         if !self.writes_enabled {

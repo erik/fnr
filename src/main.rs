@@ -1,12 +1,13 @@
 use std::borrow::Cow;
 use std::fmt;
-use std::io::BufRead;
+use std::io;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use atty::Stream;
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{BinaryDetection, SearcherBuilder};
@@ -14,7 +15,7 @@ use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex::RegexSet;
 use structopt::clap::arg_enum;
 use structopt::StructOpt;
-use termcolor::{BufferWriter, ColorChoice};
+use termcolor::{BufferWriter, ColorChoice, StandardStream};
 
 mod printer;
 mod replace;
@@ -34,7 +35,7 @@ arg_enum! {
 }
 
 #[derive(Debug)]
-struct Statistics {
+pub struct Statistics {
     wall_time_ns: AtomicU64,
     search_time_ns: AtomicU64,
     files_total: AtomicUsize,
@@ -72,6 +73,14 @@ impl Statistics {
             num_matches: 0.into(),
             num_replacements: 0.into(),
         }
+    }
+
+    fn num_matches(&self) -> usize {
+        self.num_matches.load(Ordering::Relaxed)
+    }
+
+    fn num_replacements(&self) -> usize {
+        self.num_replacements.load(Ordering::Relaxed)
     }
 
     fn search_timer(&self) -> StatSearchTimer {
@@ -439,9 +448,90 @@ impl FindAndReplacer {
         })
     }
 
+    fn run(&mut self) -> Result<()> {
+        if self.config.prompt {
+            self.run_with_prompt()
+        } else {
+            self.run_parallel()
+        }
+    }
+
     fn run_with_prompt(&mut self) -> Result<()> {
-        // TODO: Write single threaded variant once the basic data
-        // structures are stable.
+        let stats = Arc::new(Statistics::new());
+        let start_time = Instant::now();
+
+        let mut searcher = self.searcher_factory.build();
+        let mut replacer = self.replacer_factory.build();
+
+        let mut writer = StandardStream::stdout(self.config.color_choice());
+        let mut match_printer = self.match_printer.build(&mut writer);
+
+        for dir_entry in self.file_walker.build() {
+            let _search_timer = stats.search_timer();
+
+            let path = match dir_entry {
+                Ok(ref entry) => {
+                    if !self.path_matcher.should_search(entry) {
+                        stats.visit_file(false);
+                        continue;
+                    }
+
+                    entry.path()
+                }
+
+                Err(err) => {
+                    eprintln!("error: {}", err);
+                    continue;
+                }
+            };
+
+            stats.visit_file(true);
+
+            let matches = match searcher.search_path(path) {
+                Ok(matches) => {
+                    // No futher processing required for empty matches.
+                    if matches.is_empty() {
+                        continue;
+                    }
+
+                    stats.add_matches(matches.len());
+                    matches
+                }
+
+                err => {
+                    eprintln!("search failed: {:?}", err);
+                    break;
+                }
+            };
+
+            let mut should_quit = false;
+            let num_replaced =
+                replacer.consume_matches(path, matches, &mut match_printer, &mut should_quit);
+
+            match num_replaced {
+                Ok(num) => {
+                    if num > 0 {
+                        stats.add_replacements(num);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("{}: {}", path.display(), err);
+                    break;
+                }
+            }
+
+            if should_quit {
+                break;
+            }
+        }
+
+        stats.add_elapsed_wall_time(start_time.elapsed());
+        match_printer.display_footer(&stats)?;
+
+        if self.config.print_stats {
+            writeln!(&mut writer, "{}", stats)?;
+        }
+
         Ok(())
     }
 
@@ -506,8 +596,11 @@ impl FindAndReplacer {
                     replacer.consume_matches(path, matches, &mut match_printer, &mut should_quit);
 
                 match num_replaced {
-                    Ok(num) if num > 0 => stats.add_replacements(num),
-                    Ok(_) => (),
+                    Ok(num) => {
+                        if num > 0 {
+                            stats.add_replacements(num);
+                        }
+                    }
                     Err(err) => {
                         eprintln!("{}: {}", path.display(), err);
                         return WalkState::Quit;
@@ -515,25 +608,34 @@ impl FindAndReplacer {
                 }
 
                 if let Err(err) = writer.print(&buffer) {
-                    if err.kind() == std::io::ErrorKind::BrokenPipe {
+                    if err.kind() == io::ErrorKind::BrokenPipe {
                         return WalkState::Quit;
                     }
                     eprintln!("{}: {}", path.display(), err);
                 }
 
-                WalkState::Continue
+                if should_quit {
+                    WalkState::Quit
+                } else {
+                    WalkState::Continue
+                }
             })
         });
 
         stats.add_elapsed_wall_time(start_time.elapsed());
 
-        // TODO:
-        // let mut buffer = writer.buffer();
-        // let mut match_printer = match_printer.build(&mut buffer);
-        // match_printer.print_footer(stats);
+        let mut buffer = writer.buffer();
+        let mut match_printer = self.match_printer.build(&mut buffer);
+        match_printer.display_footer(&stats)?;
 
         if self.config.print_stats {
-            println!("{}", stats);
+            writeln!(&mut buffer, "{}", stats)?;
+        }
+
+        if let Err(err) = writer.print(&buffer) {
+            if err.kind() != io::ErrorKind::BrokenPipe {
+                return Err(anyhow!(err));
+            }
         }
 
         Ok(())
@@ -572,7 +674,7 @@ fn run_find_and_replace() -> Result<()> {
     let config = Config::from_args();
     let mut find_and_replacer = FindAndReplacer::from_config(config)?;
 
-    find_and_replacer.run_parallel()
+    find_and_replacer.run()
 }
 
 fn main() {
