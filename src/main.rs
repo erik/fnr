@@ -1,8 +1,10 @@
 use std::borrow::Cow;
+use std::fmt;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
 use atty::Stream;
@@ -33,29 +35,69 @@ arg_enum! {
 
 #[derive(Debug)]
 struct Statistics {
+    wall_time_ns: AtomicU64,
+    search_time_ns: AtomicU64,
     files_total: AtomicUsize,
-    files_checked: AtomicUsize,
+    files_searched: AtomicUsize,
     files_ignored: AtomicUsize,
-    files_with_match: AtomicUsize,
+    files_with_matches: AtomicUsize,
+    files_with_replacements: AtomicUsize,
     num_matches: AtomicUsize,
+    num_replacements: AtomicUsize,
+}
+
+struct StatSearchTimer<'a> {
+    started_at: Instant,
+    stats: &'a Statistics,
+}
+
+impl<'a> Drop for StatSearchTimer<'a> {
+    fn drop(&mut self) {
+        let elapsed = self.started_at.elapsed();
+        self.stats.add_elapsed_search_time(elapsed);
+    }
 }
 
 impl Statistics {
     fn new() -> Statistics {
         Statistics {
+            wall_time_ns: 0.into(),
+            search_time_ns: 0.into(),
             files_total: 0.into(),
-            files_checked: 0.into(),
+            files_searched: 0.into(),
             files_ignored: 0.into(),
-            files_with_match: 0.into(),
+            files_with_matches: 0.into(),
+            files_with_replacements: 0.into(),
+
             num_matches: 0.into(),
+            num_replacements: 0.into(),
+        }
+    }
+
+    fn search_timer(&self) -> StatSearchTimer {
+        StatSearchTimer {
+            stats: self,
+            started_at: Instant::now(),
         }
     }
 
     #[inline]
-    fn visit_file(&self, checked: bool) {
+    fn add_elapsed_wall_time(&self, d: Duration) {
+        self.wall_time_ns
+            .fetch_add(d.as_nanos().try_into().unwrap_or(0), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn add_elapsed_search_time(&self, d: Duration) {
+        self.search_time_ns
+            .fetch_add(d.as_nanos().try_into().unwrap_or(0), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn visit_file(&self, searched: bool) {
         self.files_total.fetch_add(1, Ordering::Relaxed);
-        if checked {
-            self.files_checked.fetch_add(1, Ordering::Relaxed);
+        if searched {
+            self.files_searched.fetch_add(1, Ordering::Relaxed);
         } else {
             self.files_ignored.fetch_add(1, Ordering::Relaxed);
         }
@@ -63,8 +105,45 @@ impl Statistics {
 
     #[inline]
     fn add_matches(&self, num_matches: usize) {
-        self.files_with_match.fetch_add(1, Ordering::Relaxed);
+        self.files_with_matches.fetch_add(1, Ordering::Relaxed);
         self.num_matches.fetch_add(num_matches, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn add_replacements(&self, num_replacements: usize) {
+        self.files_with_replacements.fetch_add(1, Ordering::Relaxed);
+        self.num_replacements
+            .fetch_add(num_replacements, Ordering::Relaxed);
+    }
+}
+
+impl fmt::Display for Statistics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "\
+wall time               {wall_time_secs} s
+search time             {search_time_secs} s
+num matches             {num_matches:?}
+num replacements        {num_replacements:?}
+total files             {files_total:?}
+  ... ignored           {files_ignored:?}
+  ... searched          {files_searched:?}
+  ... with matches      {files_with_matches:?}
+  ... with replacements {files_with_replacements:?}
+",
+            wall_time_secs =
+                Duration::from_nanos(self.wall_time_ns.load(Ordering::Relaxed)).as_secs_f32(),
+            search_time_secs =
+                Duration::from_nanos(self.search_time_ns.load(Ordering::Relaxed)).as_secs_f32(),
+            num_matches = self.num_matches,
+            num_replacements = self.num_replacements,
+            files_total = self.files_total,
+            files_ignored = self.files_ignored,
+            files_searched = self.files_searched,
+            files_with_matches = self.files_with_matches,
+            files_with_replacements = self.files_with_replacements,
+        )
     }
 }
 
@@ -80,7 +159,6 @@ impl Statistics {
 // /// Save changes as a .patch file rather than modifying in place.
 // #[structopt(long)]
 // write_patch: bool
-//
 struct Config {
     /// Match case insensitively.
     #[structopt(short = "i", long, conflicts_with = "case_sensitive, smart_case")]
@@ -367,6 +445,7 @@ impl FindAndReplacer {
     fn run_parallel(&mut self) -> Result<()> {
         let writer = BufferWriter::stdout(self.config.color_choice());
         let stats = Arc::new(Statistics::new());
+        let start_time = Instant::now();
 
         let file_walker = self.file_walker.build_parallel();
         file_walker.run(|| {
@@ -379,6 +458,8 @@ impl FindAndReplacer {
             let mut replacer = self.replacer_factory.build();
 
             Box::new(move |dir_entry| {
+                let _search_timer = stats.search_timer();
+
                 let path = match dir_entry {
                     Ok(ref ent) => {
                         // Don't need to consider directories
@@ -423,7 +504,18 @@ impl FindAndReplacer {
                 let mut buffer = writer.buffer();
                 let mut match_printer = match_printer.build(&mut buffer);
 
-                let should_proceed = replacer.consume_matches(path, matches, &mut match_printer);
+                let mut should_quit = false;
+                let num_replaced =
+                    replacer.consume_matches(path, matches, &mut match_printer, &mut should_quit);
+
+                match num_replaced {
+                    Ok(num) if num > 0 => stats.add_replacements(num),
+                    Ok(_) => (),
+                    Err(err) => {
+                        eprintln!("{}: {}", path.display(), err);
+                        return WalkState::Quit;
+                    }
+                }
 
                 if let Err(err) = writer.print(&buffer) {
                     if err.kind() == std::io::ErrorKind::BrokenPipe {
@@ -432,23 +524,19 @@ impl FindAndReplacer {
                     eprintln!("{}: {}", path.display(), err);
                 }
 
-                match should_proceed {
-                    Ok(true) => WalkState::Continue,
-                    Ok(false) => WalkState::Quit,
-                    Err(err) => {
-                        eprintln!("{}: {}", path.display(), err);
-                        WalkState::Quit
-                    }
-                }
+                WalkState::Continue
             })
         });
+
+        let elapsed = start_time.elapsed();
+        stats.add_elapsed_wall_time(elapsed);
 
         // TODO:
         // let mut buffer = writer.buffer();
         // let mut match_printer = match_printer.build(&mut buffer);
         // match_printer.print_footer(stats);
 
-        println!("{:?}", stats);
+        println!("{}", stats);
 
         Ok(())
     }

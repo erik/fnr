@@ -147,9 +147,10 @@ impl Replacer {
         path: &Path,
         matches: Vec<Match>,
         match_printer: &mut MatchPrinter<W>,
-    ) -> Result<bool> {
+        should_quit: &mut bool,
+    ) -> Result<usize> {
         if matches.is_empty() {
-            return Ok(true);
+            return Ok(0);
         }
 
         match_printer.display_header(path, matches.len())?;
@@ -184,22 +185,24 @@ impl Replacer {
                 }
                 ReplacementDecision::Terminate => {
                     println!("exiting!");
-                    // TODO: represent this code more cleanly?
-                    return Ok(false);
+                    *should_quit = true;
+                    return Ok(0);
                 }
             };
 
             replacement_list.push(match_replacement);
         }
 
-        if !replacement_list.is_empty() {
-            self.apply(path, &replacement_list)?;
-        }
+        let num_replaced = if replacement_list.is_empty() {
+            0
+        } else {
+            self.apply(path, &replacement_list)?
+        };
 
-        Ok(true)
+        Ok(num_replaced)
     }
 
-    fn apply(&self, path: &Path, mut replacements: &[MatchReplacement]) -> Result<()> {
+    fn apply(&self, path: &Path, mut replacements: &[MatchReplacement]) -> Result<usize> {
         let dst_path = path.with_extension("~");
         let src = File::open(path)?;
         let dst = File::create(&dst_path)?;
@@ -209,6 +212,7 @@ impl Replacer {
 
         let mut line_num = 0;
         let mut line = String::new();
+        let mut num_replaced = 0;
         loop {
             line.clear();
             let bytes_read = reader.read_line(&mut line)?;
@@ -225,6 +229,7 @@ impl Replacer {
                 .unwrap_or(false);
 
             let new_line = if line_has_replacement {
+                num_replaced += 1;
                 let repl = replacements[0].replacement.as_bytes();
                 replacements = &replacements[1..];
                 repl
@@ -240,7 +245,7 @@ impl Replacer {
         }
 
         std::fs::rename(dst_path, path)?;
-        Ok(())
+        Ok(num_replaced)
     }
 
     fn replace_with_captures(&self, input: &str) -> Result<String> {
