@@ -40,7 +40,7 @@ Replace using capturing groups.
 fnr 'const (\w+) = \d+;' 'const $1 = 42;'
 ```
 
-Use `-w --write` to write changes back to files.
+Use `-W --write` to write changes back to files.
 ```
 fnr --write 'Linus Torvalds' 'Linux Torvalds'
 ```

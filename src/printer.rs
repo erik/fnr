@@ -170,7 +170,7 @@ impl<'a, W: WriteColor> MatchPrinter<'a, W> {
         if !self.writes_enabled {
             writeln!(
                 &mut self.writer,
-                "Use -w, --write to modify files in place."
+                "Rerun with --write to modify files in place."
             )?;
         }
 
