@@ -9,12 +9,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, ensure, Context, Result};
 use atty::Stream;
+use clap::Parser;
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{BinaryDetection, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex::RegexSet;
-use structopt::clap::arg_enum;
-use structopt::StructOpt;
 use termcolor::{BufferWriter, ColorChoice, StandardStream};
 
 mod printer;
@@ -24,15 +23,6 @@ mod search;
 use crate::printer::{MatchPrintMode, MatchPrinterBuilder};
 use crate::replace::{ReplacementDecider, ReplacementDecision, ReplacerFactory};
 use crate::search::RegexSearcherFactory;
-
-arg_enum! {
-    #[derive(Debug)]
-    enum ColorPreference {
-        Always,
-        Auto,
-        Never
-    }
-}
 
 #[derive(Debug)]
 pub struct Statistics {
@@ -155,114 +145,116 @@ total files             {files_total:?}
     }
 }
 
-#[derive(Debug, StructOpt)]
-#[structopt(name = "fnr")]
+#[derive(Debug, clap::ArgEnum, Clone)]
+enum ColorPreference {
+    Always,
+    Auto,
+    Never,
+}
+
+#[derive(Debug, clap::Parser)]
+#[clap(name = "fnr", about, version, author)]
 /// Recursively find and replace. Like sed, but memorable.
 // TODO: Potential features:
 //
 // /// Search files with the given file extensions.
-// #[structopt(short = "T", long, multiple = true, conflicts_with = "include")]
+// #[clap(short = "T", long, multiple = true, conflicts_with = "include")]
 // file_type: Option<String>,
 //
 // /// Save changes as a .patch file rather than modifying in place.
-// #[structopt(long)]
+// #[clap(long)]
 // write_patch: bool
 struct Config {
     /// Match case insensitively.
-    #[structopt(short = "i", long, conflicts_with = "case_sensitive, smart_case")]
+    #[clap(short = 'i', long)]
     ignore_case: bool,
 
     /// Match case sensitively.
-    #[structopt(short = "s", long, conflicts_with = "ignore_case, smart_case")]
+    #[clap(short = 's', long)]
     case_sensitive: bool,
 
     /// Match case sensitively if FIND has uppercase characters,
     /// insensitively otherwise. [default: true].
-    #[structopt(
-        short = "S",
+    #[clap(
+        short = 'S',
         long,
-        conflicts_with = "ignore_case, case_sensitive",
+        conflicts_with_all = &["ignore-case", "case-sensitive"],
         takes_value = false
     )]
     smart_case: Option<bool>,
 
     /// Disable printing matches
-    #[structopt(short, long, conflicts_with = "prompt")]
+    #[clap(short, long, conflicts_with = "prompt")]
     quiet: bool,
 
     /// Display compacted output format
-    #[structopt(short, long, conflicts_with = "prompt, quiet")]
+    #[clap(short, long, conflicts_with_all = &["prompt", "quiet"])]
     compact: bool,
 
     /// Modify files in place.
-    #[structopt(short = "W", long, conflicts_with = "prompt")]
+    #[clap(short = 'W', long, conflicts_with = "prompt")]
     write: bool,
 
     /// Treat FIND as a string rather than a regular expression.
-    #[structopt(short = "Q", long)]
+    #[clap(short = 'Q', long)]
     literal: bool,
 
     /// Match FIND only at word boundary.
-    #[structopt(short, long)]
+    #[clap(short, long)]
     word: bool,
 
     /// Search ALL files in given paths for matches.
-    #[structopt(short, long, conflicts_with = "hidden")]
+    #[clap(short, long, conflicts_with = "hidden")]
     all_files: bool,
 
     /// Find replacements in hidden files and directories.
-    #[structopt(short = "H", long, conflicts_with = "all_files")]
+    #[clap(short = 'H', long, conflicts_with = "all-files")]
     hidden: bool,
 
     /// Confirm each modification before making it. Implies --write.
-    #[structopt(short, long, conflicts_with = "write")]
+    #[clap(short, long, conflicts_with = "write")]
     prompt: bool,
 
     /// Print lines after matches.
-    #[structopt(short = "A", long)]
+    #[clap(short = 'A', long)]
     after: Option<usize>,
 
     /// Print lines before matches.
-    #[structopt(short = "B", long)]
+    #[clap(short = 'B', long)]
     before: Option<usize>,
 
     /// Print lines before and after matches.
-    #[structopt(short = "C", long, conflicts_with = "after, before")]
+    #[clap(short = 'C', long, conflicts_with_all = &["after", "before"])]
     context: Option<usize>,
 
     /// Include only files or directories matching pattern.
-    #[structopt(short = "I", long)]
+    #[clap(short = 'I', long)]
     include: Option<Vec<String>>,
 
     /// Exclude files or directories matching pattern.
-    #[structopt(short = "E", long)]
+    #[clap(short = 'E', long)]
     exclude: Vec<String>,
 
     /// Control whether terminal output is in color.
-    #[structopt(
-        long,
-        possible_values = &ColorPreference::variants(),
-        case_insensitive = true,
-        default_value = "auto"
-    )]
+    #[clap(arg_enum, long, ignore_case = true, default_value = "auto")]
     color: ColorPreference,
 
     /// Print debug statistics about match.
-    #[structopt(long = "stats")]
+    #[clap(long = "stats")]
     print_stats: bool,
 
     /// What to search for. Literal string or regular expression.
     ///
     /// For supported regular expression syntax, see:
     /// https://docs.rs/regex/latest/regex/#syntax
-    #[structopt(name = "FIND", required = true)]
+    #[clap(name = "FIND", required = true)]
     find: String,
 
     /// What to replace it with.
     ///
     /// May contain numbered references to capture groups given in
     /// FIND in the form $1, $2, etc.
-    #[structopt(name = "REPLACE", required = true)]
+    #[clap(name = "REPLACE", required = true)]
     replace: String,
 
     /// Locations to search. Current directory if not given.
@@ -270,7 +262,7 @@ struct Config {
     /// Paths may also be provided through standard input, e.g.
     ///
     /// $ fd .rs | fnr 'old_fn' 'new_fn'
-    #[structopt(name = "PATH", parse(from_os_str))]
+    #[clap(name = "PATH", parse(from_os_str))]
     paths: Vec<PathBuf>,
 }
 
@@ -556,6 +548,7 @@ impl FindAndReplacer {
                 let path = match dir_entry {
                     Ok(ref entry) => {
                         if !path_matcher.should_search(entry) {
+                            // TODO: this counts directories
                             stats.visit_file(false);
                             return WalkState::Continue;
                         }
@@ -671,7 +664,7 @@ impl PathMatcher {
 
 // Main entry point
 fn run_find_and_replace() -> Result<()> {
-    let config = Config::from_args();
+    let config = Config::parse();
     let mut find_and_replacer = FindAndReplacer::from_config(config)?;
 
     find_and_replacer.run()
