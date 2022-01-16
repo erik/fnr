@@ -15,13 +15,13 @@ fn create_test_files<'a>(files: impl IntoIterator<Item = &'a (&'a str, &'a str)>
 }
 
 #[test]
-fn test_simple_replace_without_write() {
+fn test_simple_replace_with_dry_run() {
     let orig_content = "foo\nbar\nbaz\n";
     let test_dir = create_test_files(&[("foo.txt", orig_content), ("bar.txt", orig_content)]);
 
     Command::cargo_bin("fnr")
         .unwrap()
-        .args(&["foo", "bar", test_dir.path().to_str().unwrap()])
+        .args(&["foo", "bar", "--dry-run", test_dir.path().to_str().unwrap()])
         .assert()
         .success();
 

@@ -184,16 +184,20 @@ struct Config {
     smart_case: Option<bool>,
 
     /// Disable printing matches
-    #[clap(short, long, conflicts_with = "prompt")]
+    #[clap(short, long)]
     quiet: bool,
 
     /// Display compacted output format
-    #[clap(short, long, conflicts_with_all = &["prompt", "quiet"])]
+    #[clap(short, long, conflicts_with_all = &["quiet"])]
     compact: bool,
 
     /// Modify files in place.
-    #[clap(short = 'W', long, conflicts_with = "prompt")]
+    #[clap(short = 'W', long)]
     write: bool,
+
+    /// Perform search and replace without modifying files.
+    #[clap(long)]
+    dry_run: bool,
 
     /// Treat FIND as a string rather than a regular expression.
     #[clap(short = 'Q', long)]
@@ -210,10 +214,6 @@ struct Config {
     /// Find replacements in hidden files and directories.
     #[clap(short = 'H', long, conflicts_with = "all-files")]
     hidden: bool,
-
-    /// Confirm each modification before making it. Implies --write.
-    #[clap(short, long, conflicts_with = "write")]
-    prompt: bool,
 
     /// Print lines after matches.
     #[clap(short = 'A', long)]
@@ -314,8 +314,8 @@ impl Config {
         // Otherwise, we just search the current directory.
         let paths = if !atty::is(Stream::Stdin) {
             ensure!(
-                !self.prompt,
-                "cannot use --prompt when reading files from stdin"
+                !self.is_interactive(),
+                "cannot use interactive prompt when reading files from stdin"
             );
             let mut paths = vec![];
             for line in std::io::stdin().lock().lines() {
@@ -353,12 +353,12 @@ impl Config {
     }
 
     fn replacement_decider(&self) -> ReplacementDecider {
-        if self.prompt {
-            ReplacementDecider::with_prompt()
-        } else if self.write {
+        if self.write {
             ReplacementDecider::constantly(ReplacementDecision::Accept)
-        } else {
+        } else if self.dry_run {
             ReplacementDecider::constantly(ReplacementDecision::Ignore)
+        } else {
+            ReplacementDecider::with_prompt()
         }
     }
 
@@ -386,7 +386,7 @@ impl Config {
             } else {
                 MatchPrintMode::Full
             },
-            writes_enabled: self.write || self.prompt,
+            writes_enabled: self.write || self.is_interactive(),
         }
     }
 
@@ -402,6 +402,11 @@ impl Config {
             }
             ColorPreference::Never => ColorChoice::Never,
         }
+    }
+
+    /// Whether to run with an interactive prompt
+    fn is_interactive(&self) -> bool {
+        !self.dry_run && !self.write
     }
 }
 
@@ -441,7 +446,8 @@ impl FindAndReplacer {
     }
 
     fn run(&mut self) -> Result<()> {
-        if self.config.prompt {
+        // We can only use parallel mode if we're not using the interactive prompt.
+        if self.config.is_interactive() {
             self.run_with_prompt()
         } else {
             self.run_parallel()

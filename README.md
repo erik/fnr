@@ -40,7 +40,7 @@ Replace using capturing groups.
 fnr 'const (\w+) = \d+;' 'const $1 = 42;'
 ```
 
-Use `-W --write` to write changes back to files.
+Use `-W --write` to write changes back to files without prompting.
 ```
 fnr --write 'Linus Torvalds' 'Linux Torvalds'
 ```
@@ -58,15 +58,6 @@ fnr --exclude ChangeLog 2021 2022
 Files and directories to consider can also be given over standard input.
 ```
 find /tmp/ -name "*.csv" -print | fnr "," "\t"
-```
-
-Use `-p --prompt` to individually accept or reject each replacement.
-```
-fnr --prompt --literal 'i++' '++i'
---- ./README.md: 2 matching lines
--   18: $ fnr --literal 'i += 1' 'i++'
-+   18: $ fnr --literal 'i += 1' '++i'
-Stage this replacement [y,n,q,a,e,d,?] ?
 ```
 
 ## Installation
